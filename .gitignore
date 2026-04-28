@@ -8,30 +8,17 @@ Data/Assets/jbh_icon_pack_preview.png
 
 # Saved configs
 Configs/*.json
-runtime/*.json
+Data/*.json
 
 # Python cache
 __pycache__/
 *.py[cod]
 
-# Build / packaging
-build/
-dist/
-*.spec
+# Keep checked-in build helpers under Data/Scripts/Build Files.
+!Data/Scripts/Build Files/
+!Data/Scripts/Build Files/build_exe.bat
+!Data/Scripts/Build Files/build.ps1
+!Data/Scripts/Build Files/build_jbh_backup_manager.spec
 
-# Virtual environments
-.venv/
-venv/
-env/
-
-# Editor folders
-.vscode/
-.idea/
-
-# Temporary / backup files
-*.tmp
-*.bak
-*.old
-
-# Backup working folders
-Work_Folder/
+# Development files
+Development/

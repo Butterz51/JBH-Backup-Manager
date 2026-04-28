@@ -4,13 +4,14 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import webbrowser
 from collections import deque
-from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import (
@@ -29,325 +30,109 @@ from tkinter import (
     Label,
     LabelFrame,
     Listbox,
-    Menu,
     PhotoImage,
     Scrollbar,
     StringVar,
     Text,
     Tk,
     Toplevel,
-    messagebox,
     filedialog,
+    messagebox,
 )
 from tkinter import ttk
 
-import hashlib
-import hmac
-import struct
-import zlib
-
-
-class AppMetadataError(RuntimeError):
-    """Raised when the application metadata blob is missing or invalid."""
-
-
-@dataclass(frozen=True)
-class AppMetadata:
-    app_title: str
-    version: str
-    build: str
-    author: str
-    donation_url: str
-    discord_url: str
-    repo_url: str
-    readme_url: str
-
-    def validate(self) -> "AppMetadata":
-        required_values = {
-            "Application title": self.app_title,
-            "Version": self.version,
-            "Build": self.build,
-            "Author": self.author,
-            "Donation URL": self.donation_url,
-            "Discord URL": self.discord_url,
-            "Repository URL": self.repo_url,
-            "Read Me URL": self.readme_url,
-        }
-        for label, value in required_values.items():
-            if not isinstance(value, str) or not value.strip():
-                raise AppMetadataError(f"{label} is missing or invalid.")
-        return self
-
-
-@dataclass(frozen=True)
-class AppRuntimeSettings:
-    asset_dir_relative_candidates: tuple[str, ...] = ("Data/Assets", "Assets", ".")
-    config_dir_name: str = "configs"
-    runtime_dir_name: str = "runtime"
-    state_file_name: str = "app_state.json"
-    last_session_file_name: str = "last_session.json"
-    app_settings_file_name: str = "app_settings.json"
-    startup_registry_value_name: str = "JBHServicesBackupManager"
-    quiet_period_seconds: int = 5
-    fft_seconds: int = 2
-    rate_sample_interval_seconds: float = 0.5
-    startup_delay_options: dict[str, int] = field(default_factory=lambda: {
-        "Off": 0,
-        "15s": 15,
-        "30s": 30,
-        "60s": 60,
-    })
-    bg: str = "#060B14"
-    card: str = "#0D1624"
-    card_alt: str = "#0A111C"
-    text: str = "#EEF5FF"
-    muted: str = "#96A8BF"
-    border: str = "#21415F"
-    accent: str = "#27A9FF"
-    accent_alt: str = "#D89A2B"
-    warn: str = "#8C3419"
-    btn_bg: str = "#D89A2B"
-    btn_fg: str = "#081019"
-    btn_active: str = "#E4A93D"
-    input_bg: str = "#08111C"
-    input_disabled_bg: str = "#121C28"
-    disabled_button_bg: str = "#263243"
-    disabled_button_fg: str = "#7E90A7"
-    progress_bg: str = "#081019"
-    progress_fill: str = "#27A9FF"
-    mode_copy: str = "Copy"
-    mode_mirror: str = "Mirror"
-    mode_instant_sync: str = "Instant Sync"
-    job_reason_manual: str = "manual"
-    job_reason_schedule: str = "schedule"
-    job_reason_catch_up: str = "catch_up"
-    job_reason_insta_sync: str = "insta_sync"
-
-
-DEFAULT_METADATA = AppMetadata(
-    app_title="JBH Services Backup Manager",
-    version="0.0.0",
-    build="DEV",
-    author="Butterz51 / JBH Services",
-    donation_url="https://paypal.me/D2ServicesByJBH?country.x=CA&locale.x=en_US",
-    discord_url="https://discord.gg/ZJpBrkgwA7",
-    repo_url="https://github.com/Butterz51/JBH-Backup-Manager",
-    readme_url="https://github.com/Butterz51/JBH-Backup-Manager",
-).validate()
-DEFAULT_RUNTIME_SETTINGS = AppRuntimeSettings()
-
-
-_APP_CORE_MAGIC = b"JBHPI001"
-_APP_CORE_SALT_LENGTH = 16
-_APP_CORE_DIGEST_LENGTH = 32
-_APP_CORE_KEY_PARTS = (
-    "JBH",
-    "Services",
-    "::",
-    "Backup",
-    "Manager",
-    "::",
-    "Protected",
-    "Info",
-    "::",
-    "v1",
+from app_core import (
+    ACCENT,
+    ACCENT_ALT,
+    APP_DIR,
+    APP_SETTINGS_PATH,
+    ASSET_DIR,
+    BG,
+    BORDER,
+    BTN_ACTIVE,
+    BTN_BG,
+    BTN_FG,
+    CARD,
+    CARD_ALT,
+    CONFIG_DIR,
+    DISABLED_BUTTON_BG,
+    DISABLED_BUTTON_FG,
+    INPUT_BG,
+    INPUT_DISABLED_BG,
+    JOB_REASON_CATCH_UP,
+    JOB_REASON_INSTA_SYNC,
+    JOB_REASON_MANUAL,
+    JOB_REASON_SCHEDULE,
+    LAST_SESSION_PATH,
+    MODE_COPY,
+    MODE_INSTANT_SYNC,
+    MODE_MIRROR,
+    MUTED,
+    PROGRESS_BG,
+    PROGRESS_FILL,
+    RATE_SAMPLE_INTERVAL_SECONDS,
+    RUNTIME_DIR,
+    STARTUP_ADMIN_APPLY_TASK_ARGUMENT,
+    STARTUP_ADMIN_OPTIONS,
+    STARTUP_ADMIN_RELAUNCH_ARGUMENT,
+    STARTUP_DELAY_OPTIONS,
+    STARTUP_TASK_FOLDER_PATH,
+    STARTUP_TASK_NAME,
+    STATE_PATH,
+    TEXT,
+    WARN,
+    WINDOWS_CREATE_NO_WINDOW,
+    AppMetadata,
+    load_app_metadata,
 )
-_APP_CORE_CACHE: dict[str, object] | None = None
-
-
-def _get_app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
-APP_DIR = _get_app_dir()
-
-
-def _derive_app_core_master_key() -> bytes:
-    return hashlib.sha256("".join(_APP_CORE_KEY_PARTS).encode("utf-8")).digest()
-
-
-def _build_app_core_keystream(*, secret: bytes, salt: bytes, length: int) -> bytes:
-    stream = bytearray()
-    counter = 0
-    while len(stream) < length:
-        stream.extend(hashlib.sha256(secret + salt + counter.to_bytes(4, "big")).digest())
-        counter += 1
-    return bytes(stream[:length])
-
-
-def _xor_bytes(left: bytes, right: bytes) -> bytes:
-    return bytes(a ^ b for a, b in zip(left, right))
-
-
-def _normalize_relative_path(value: str) -> Path:
-    cleaned = str(value or ".").strip().replace("\\", "/")
-    if cleaned in {"", ".", "./"}:
-        return Path()
-    return Path(*[part for part in cleaned.split("/") if part and part != "."])
-
-
-def _resolve_app_core_candidates(app_dir: Path) -> list[Path]:
-    runtime_candidates = [
-        app_dir / "Data" / "Assets" / "AppCore.dll",
-        app_dir / "Assets" / "AppCore.dll",
-        app_dir / "AppCore.dll",
-    ]
-    return runtime_candidates
-
-
-def _read_app_core_blob(app_dir: Path) -> bytes:
-    for candidate in _resolve_app_core_candidates(app_dir):
-        if candidate.exists():
-            return candidate.read_bytes()
-    raise AppMetadataError("AppCore.dll could not be found in any supported asset location.")
-
-
-def _decode_app_core_payload(blob: bytes) -> dict:
-    minimum_length = len(_APP_CORE_MAGIC) + _APP_CORE_SALT_LENGTH + 4 + _APP_CORE_DIGEST_LENGTH
-    if len(blob) < minimum_length:
-        raise AppMetadataError("AppCore.dll is too small to contain valid application data.")
-    if blob[: len(_APP_CORE_MAGIC)] != _APP_CORE_MAGIC:
-        raise AppMetadataError("AppCore.dll signature is invalid.")
-
-    salt_start = len(_APP_CORE_MAGIC)
-    salt_end = salt_start + _APP_CORE_SALT_LENGTH
-    payload_length_end = salt_end + 4
-    digest_end = payload_length_end + _APP_CORE_DIGEST_LENGTH
-
-    salt = blob[salt_start:salt_end]
-    encrypted_length = struct.unpack(">I", blob[salt_end:payload_length_end])[0]
-    encrypted_payload = blob[digest_end : digest_end + encrypted_length]
-    expected_digest = blob[payload_length_end:digest_end]
-
-    if len(encrypted_payload) != encrypted_length:
-        raise AppMetadataError("AppCore.dll payload length is incomplete or corrupted.")
-
-    header = blob[:payload_length_end]
-    actual_digest = hmac.new(_derive_app_core_master_key(), header + encrypted_payload, hashlib.sha256).digest()
-    if not hmac.compare_digest(expected_digest, actual_digest):
-        raise AppMetadataError("AppCore.dll integrity validation failed.")
-
-    keystream = _build_app_core_keystream(
-        secret=_derive_app_core_master_key(),
-        salt=salt,
-        length=len(encrypted_payload),
-    )
-    decrypted_payload = _xor_bytes(encrypted_payload, keystream)
-
-    try:
-        decompressed_payload = zlib.decompress(decrypted_payload)
-        payload = json.loads(decompressed_payload.decode("utf-8"))
-    except Exception as exc:
-        raise AppMetadataError(f"AppCore.dll could not be decoded: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise AppMetadataError("AppCore.dll payload is not a JSON object.")
-    return payload
-
-
-def _parse_app_core_payload(payload: dict) -> dict[str, object]:
-    if "metadata" in payload or "runtime" in payload:
-        metadata_data = payload.get("metadata") or {}
-        runtime_data = payload.get("runtime") or {}
-    else:
-        metadata_data = payload
-        runtime_data = {}
-
-    if not isinstance(metadata_data, dict):
-        raise AppMetadataError("AppCore.dll metadata payload is invalid.")
-    if not isinstance(runtime_data, dict):
-        raise AppMetadataError("AppCore.dll runtime payload is invalid.")
-
-    update_url = str(metadata_data.get("app_update_url") or metadata_data.get("repo_url") or DEFAULT_METADATA.repo_url)
-    metadata = AppMetadata(
-        app_title=str(metadata_data.get("app_title", DEFAULT_METADATA.app_title)),
-        version=str(metadata_data.get("version", DEFAULT_METADATA.version)),
-        build=str(metadata_data.get("build", DEFAULT_METADATA.build)),
-        author=str(metadata_data.get("author", DEFAULT_METADATA.author)),
-        donation_url=str(metadata_data.get("donation_url", DEFAULT_METADATA.donation_url)),
-        discord_url=str(metadata_data.get("discord_url", DEFAULT_METADATA.discord_url)),
-        repo_url=str(metadata_data.get("repo_url") or update_url),
-        readme_url=str(metadata_data.get("readme_url") or update_url),
-    ).validate()
-
-    default_runtime = DEFAULT_RUNTIME_SETTINGS
-    startup_delay_options = {
-        str(key): int(value)
-        for key, value in (runtime_data.get("startup_delay_options") or default_runtime.startup_delay_options).items()
-    }
-
-    runtime = AppRuntimeSettings(
-        asset_dir_relative_candidates=tuple(str(x) for x in runtime_data.get("asset_dir_relative_candidates", default_runtime.asset_dir_relative_candidates)),
-        config_dir_name=str(runtime_data.get("config_dir_name", default_runtime.config_dir_name)),
-        runtime_dir_name=str(runtime_data.get("runtime_dir_name", default_runtime.runtime_dir_name)),
-        state_file_name=str(runtime_data.get("state_file_name", default_runtime.state_file_name)),
-        last_session_file_name=str(runtime_data.get("last_session_file_name", default_runtime.last_session_file_name)),
-        app_settings_file_name=str(runtime_data.get("app_settings_file_name", default_runtime.app_settings_file_name)),
-        startup_registry_value_name=str(runtime_data.get("startup_registry_value_name", default_runtime.startup_registry_value_name)),
-        quiet_period_seconds=int(runtime_data.get("quiet_period_seconds", default_runtime.quiet_period_seconds)),
-        fft_seconds=int(runtime_data.get("fft_seconds", default_runtime.fft_seconds)),
-        rate_sample_interval_seconds=float(runtime_data.get("rate_sample_interval_seconds", default_runtime.rate_sample_interval_seconds)),
-        startup_delay_options=startup_delay_options,
-        bg=str(runtime_data.get("bg", default_runtime.bg)),
-        card=str(runtime_data.get("card", default_runtime.card)),
-        card_alt=str(runtime_data.get("card_alt", default_runtime.card_alt)),
-        text=str(runtime_data.get("text", default_runtime.text)),
-        muted=str(runtime_data.get("muted", default_runtime.muted)),
-        border=str(runtime_data.get("border", default_runtime.border)),
-        accent=str(runtime_data.get("accent", default_runtime.accent)),
-        accent_alt=str(runtime_data.get("accent_alt", default_runtime.accent_alt)),
-        warn=str(runtime_data.get("warn", default_runtime.warn)),
-        btn_bg=str(runtime_data.get("btn_bg", default_runtime.btn_bg)),
-        btn_fg=str(runtime_data.get("btn_fg", default_runtime.btn_fg)),
-        btn_active=str(runtime_data.get("btn_active", default_runtime.btn_active)),
-        input_bg=str(runtime_data.get("input_bg", default_runtime.input_bg)),
-        input_disabled_bg=str(runtime_data.get("input_disabled_bg", default_runtime.input_disabled_bg)),
-        disabled_button_bg=str(runtime_data.get("disabled_button_bg", default_runtime.disabled_button_bg)),
-        disabled_button_fg=str(runtime_data.get("disabled_button_fg", default_runtime.disabled_button_fg)),
-        progress_bg=str(runtime_data.get("progress_bg", default_runtime.progress_bg)),
-        progress_fill=str(runtime_data.get("progress_fill", default_runtime.progress_fill)),
-        mode_copy=str(runtime_data.get("mode_copy", default_runtime.mode_copy)),
-        mode_mirror=str(runtime_data.get("mode_mirror", default_runtime.mode_mirror)),
-        mode_instant_sync=str(runtime_data.get("mode_instant_sync", default_runtime.mode_instant_sync)),
-        job_reason_manual=str(runtime_data.get("job_reason_manual", default_runtime.job_reason_manual)),
-        job_reason_schedule=str(runtime_data.get("job_reason_schedule", default_runtime.job_reason_schedule)),
-        job_reason_catch_up=str(runtime_data.get("job_reason_catch_up", default_runtime.job_reason_catch_up)),
-        job_reason_insta_sync=str(runtime_data.get("job_reason_insta_sync", default_runtime.job_reason_insta_sync)),
-    )
-
-    return {"metadata": metadata, "runtime": runtime}
-
-
-def _load_app_core_bundle() -> dict[str, object]:
-    global _APP_CORE_CACHE
-    if _APP_CORE_CACHE is not None:
-        return _APP_CORE_CACHE
-    payload = _decode_app_core_payload(_read_app_core_blob(APP_DIR))
-    _APP_CORE_CACHE = _parse_app_core_payload(payload)
-    return _APP_CORE_CACHE
-
-
-def load_app_metadata() -> AppMetadata:
-    return _load_app_core_bundle()["metadata"]  # type: ignore[return-value]
-
-
-def load_app_runtime_settings() -> AppRuntimeSettings:
-    return _load_app_core_bundle()["runtime"]  # type: ignore[return-value]
-
+from config_models import (
+    AppConfig,
+    BackupPlan,
+    ConfigStore,
+    JobRequest,
+    PathValidationResult,
+    PlannedFile,
+    ScheduleSettings,
+)
+from backup_utils import (
+    find_destructive_robocopy_switches,
+    is_mirror_mode,
+    is_same_or_newer,
+    normalize_backup_mode,
+    normalize_path,
+)
+from copy_mode import append_copy_source_to_plan
+from log import InMemoryLogger
+from mirror_mode import append_mirror_source_to_plan
+from schedule import (
+    SHORT_WEEKDAY_NAMES,
+    WEEKDAY_NAMES,
+    ScheduleCalculator,
+    format_schedule_display_date,
+    get_monthly_pattern_for_date,
+    get_sunday_week_index_for_date,
+    next_monthly_pattern_date,
+    normalize_enabled_disabled_label,
+    normalize_startup_delay_label,
+    nth_weekday_of_month,
+    ordinal_label,
+    parse_anchor_date,
+    parse_task_scheduler_delay_to_seconds,
+    startup_delay_seconds_to_task_scheduler_delay,
+)
+from sync_mode import InstaSyncWatcher
+from tooltip import HoverTooltip
+from uac_admin import (
+    build_current_process_launch_details,
+    is_current_process_elevated,
+    is_task_run_level_highest,
+    relaunch_current_process_as_admin,
+)
 
 try:
     import psutil  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
     psutil = None
-
-try:
-    from watchdog.events import FileSystemEventHandler  # type: ignore
-    from watchdog.observers import Observer  # type: ignore
-except Exception:  # pragma: no cover - optional dependency
-    FileSystemEventHandler = object  # type: ignore
-    Observer = None
 
 try:
     import pystray  # type: ignore
@@ -357,460 +142,252 @@ except Exception:  # pragma: no cover - optional dependency
     Image = None
     ImageDraw = None
 
-try:
-    APP_RUNTIME_SETTINGS = load_app_runtime_settings()
-except AppMetadataError:
-    APP_RUNTIME_SETTINGS = DEFAULT_RUNTIME_SETTINGS
+def list_persistent_mapped_drives() -> dict[str, str]:
+    """Return persistent mapped drives stored for the current Windows user.
 
-ASSET_DIR_CANDIDATES = [
-    APP_DIR / _normalize_relative_path(candidate)
-    for candidate in APP_RUNTIME_SETTINGS.asset_dir_relative_candidates
-]
-ASSET_DIR = next((candidate for candidate in ASSET_DIR_CANDIDATES if candidate.exists()), ASSET_DIR_CANDIDATES[0])
-CONFIG_DIR = APP_DIR / APP_RUNTIME_SETTINGS.config_dir_name
-RUNTIME_DIR = APP_DIR / APP_RUNTIME_SETTINGS.runtime_dir_name
-STATE_PATH = RUNTIME_DIR / APP_RUNTIME_SETTINGS.state_file_name
-LAST_SESSION_PATH = RUNTIME_DIR / APP_RUNTIME_SETTINGS.last_session_file_name
-APP_SETTINGS_PATH = RUNTIME_DIR / APP_RUNTIME_SETTINGS.app_settings_file_name
-STARTUP_REGISTRY_VALUE_NAME = APP_RUNTIME_SETTINGS.startup_registry_value_name
-WINDOWS_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-QUIET_PERIOD_SECONDS = APP_RUNTIME_SETTINGS.quiet_period_seconds
-FFT_SECONDS = APP_RUNTIME_SETTINGS.fft_seconds
-RATE_SAMPLE_INTERVAL_SECONDS = APP_RUNTIME_SETTINGS.rate_sample_interval_seconds
-STARTUP_DELAY_OPTIONS = dict(APP_RUNTIME_SETTINGS.startup_delay_options)
-SECONDS_TO_STARTUP_DELAY_LABEL = {value: key for key, value in STARTUP_DELAY_OPTIONS.items()}
+    Windows keeps mapped drives under HKCU\\Network. Elevated apps can read that
+    registry location but do not automatically receive the same mapped drive
+    namespace as the non-elevated user token.
+    """
+    drives: dict[str, str] = {}
+    if os.name != "nt":
+        return drives
 
-CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        import winreg
 
-BG = APP_RUNTIME_SETTINGS.bg
-CARD = APP_RUNTIME_SETTINGS.card
-CARD_ALT = APP_RUNTIME_SETTINGS.card_alt
-TEXT = APP_RUNTIME_SETTINGS.text
-MUTED = APP_RUNTIME_SETTINGS.muted
-BORDER = APP_RUNTIME_SETTINGS.border
-ACCENT = APP_RUNTIME_SETTINGS.accent
-ACCENT_ALT = APP_RUNTIME_SETTINGS.accent_alt
-WARN = APP_RUNTIME_SETTINGS.warn
-BTN_BG = APP_RUNTIME_SETTINGS.btn_bg
-BTN_FG = APP_RUNTIME_SETTINGS.btn_fg
-BTN_ACTIVE = APP_RUNTIME_SETTINGS.btn_active
-INPUT_BG = APP_RUNTIME_SETTINGS.input_bg
-INPUT_DISABLED_BG = APP_RUNTIME_SETTINGS.input_disabled_bg
-DISABLED_BUTTON_BG = APP_RUNTIME_SETTINGS.disabled_button_bg
-DISABLED_BUTTON_FG = APP_RUNTIME_SETTINGS.disabled_button_fg
-PROGRESS_BG = APP_RUNTIME_SETTINGS.progress_bg
-PROGRESS_FILL = APP_RUNTIME_SETTINGS.progress_fill
-
-MODE_COPY = APP_RUNTIME_SETTINGS.mode_copy
-MODE_MIRROR = APP_RUNTIME_SETTINGS.mode_mirror
-MODE_INSTANT_SYNC = APP_RUNTIME_SETTINGS.mode_instant_sync
-
-JOB_REASON_MANUAL = APP_RUNTIME_SETTINGS.job_reason_manual
-JOB_REASON_SCHEDULE = APP_RUNTIME_SETTINGS.job_reason_schedule
-JOB_REASON_CATCH_UP = APP_RUNTIME_SETTINGS.job_reason_catch_up
-JOB_REASON_INSTA_SYNC = APP_RUNTIME_SETTINGS.job_reason_insta_sync
-
-
-@dataclass
-class ScheduleSettings:
-    enabled: bool = False
-    schedule_type: str = "daily"  # daily, weekly, biweekly, monthly
-    hour_12: int = 12
-    minute: int = 0
-    am_pm: str = "AM"
-    monthly_day: int = 1
-    biweekly_days: list[int] = field(default_factory=lambda: [1, 15])
-    weekdays: list[int] = field(default_factory=lambda: [0])  # Monday=0
-    monthly_week_index: int = 1  # 1-4, -1 for last
-    monthly_weekday: int = 0  # Monday=0
-    biweekly_anchor_iso: str = ""
-    biweekly_weekday: int = 0
-    weekly_anchor_iso: str = ""
-    weekly_patterns: dict[str, int] = field(default_factory=dict)
-
-    def to_24_hour(self) -> tuple[int, int]:
-        hour = self.hour_12 % 12
-        if self.am_pm.upper() == "PM":
-            hour += 12
-        return hour, self.minute
-
-@dataclass
-class AppConfig:
-    config_name: str = ""
-    destination: str = ""
-    mode: str = MODE_COPY
-    sources: list[str] = field(default_factory=list)
-    schedule: ScheduleSettings = field(default_factory=ScheduleSettings)
-    last_successful_run_iso: str = ""
-    last_attempted_schedule_occurrence_iso: str = ""
-    saved_path: str = ""
-
-    def to_json(self) -> dict:
-        payload = asdict(self)
-        return payload
-
-    @classmethod
-    def from_json(cls, payload: dict) -> "AppConfig":
-        schedule_data = payload.get("schedule") or {}
-        monthly_day = int(schedule_data.get("monthly_day", 1))
-        biweekly_days = [int(x) for x in schedule_data.get("biweekly_days", [1, 15])][:2] or [1, 15]
-        weekdays = [int(x) for x in schedule_data.get("weekdays", [0])] or [0]
-        monthly_week_index = int(schedule_data.get("monthly_week_index", 0))
-        monthly_weekday = int(schedule_data.get("monthly_weekday", weekdays[0] if weekdays else 0))
-        biweekly_anchor_iso = str(schedule_data.get("biweekly_anchor_iso", ""))
-        biweekly_weekday = int(schedule_data.get("biweekly_weekday", weekdays[0] if weekdays else 0))
-        weekly_anchor_iso = str(schedule_data.get("weekly_anchor_iso", ""))
-        weekly_patterns = {str(k): int(v) for k, v in (schedule_data.get("weekly_patterns") or {}).items()}
-
-        now = datetime.now()
-        if monthly_week_index == 0:
-            fallback_monthly_date = datetime(now.year, now.month, max(1, min(28, monthly_day)))
-            monthly_week_index, monthly_weekday = get_monthly_pattern_for_date(fallback_monthly_date)
-        if not biweekly_anchor_iso:
-            fallback_biweekly_date = datetime(now.year, now.month, max(1, min(28, biweekly_days[0])))
-            biweekly_anchor_iso = fallback_biweekly_date.date().isoformat()
-            biweekly_weekday = fallback_biweekly_date.weekday()
-        if not weekly_patterns and weekly_anchor_iso:
-            parsed_weekly_anchor = parse_anchor_date(weekly_anchor_iso)
-            if parsed_weekly_anchor is not None:
-                weekly_patterns = {str(get_sunday_week_index_for_date(parsed_weekly_anchor)): parsed_weekly_anchor.weekday()}
-        if not weekly_anchor_iso:
-            fallback_weekday = weekdays[0] if weekdays else now.weekday()
-            for day in range(1, 8):
-                candidate = datetime(now.year, now.month, day)
-                if candidate.weekday() == fallback_weekday:
-                    weekly_anchor_iso = candidate.date().isoformat()
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Network") as network_key:
+            index = 0
+            while True:
+                try:
+                    drive_letter = winreg.EnumKey(network_key, index).strip().upper()
+                    index += 1
+                except OSError:
                     break
 
-        schedule = ScheduleSettings(
-            enabled=bool(schedule_data.get("enabled", False)),
-            schedule_type=str(schedule_data.get("schedule_type", "daily")),
-            hour_12=int(schedule_data.get("hour_12", 12)),
-            minute=int(schedule_data.get("minute", 0)),
-            am_pm=str(schedule_data.get("am_pm", "AM")),
-            monthly_day=monthly_day,
-            biweekly_days=biweekly_days,
-            weekdays=weekdays,
-            monthly_week_index=monthly_week_index,
-            monthly_weekday=monthly_weekday,
-            biweekly_anchor_iso=biweekly_anchor_iso,
-            biweekly_weekday=biweekly_weekday,
-            weekly_anchor_iso=weekly_anchor_iso,
-            weekly_patterns=weekly_patterns,
-        )
-        return cls(
-            config_name=str(payload.get("config_name", "")),
-            destination=str(payload.get("destination", "")),
-            mode=str(payload.get("mode", "Copy")),
-            sources=[str(x) for x in payload.get("sources", [])],
-            schedule=schedule,
-            last_successful_run_iso=str(payload.get("last_successful_run_iso", "")),
-            last_attempted_schedule_occurrence_iso=str(payload.get("last_attempted_schedule_occurrence_iso", "")),
-            saved_path=str(payload.get("saved_path", "")),
-        )
+                if len(drive_letter) != 1 or not drive_letter.isalpha():
+                    continue
 
-@dataclass
-class JobRequest:
-    reason: str  # manual, schedule, catch_up, insta_sync
-    requested_at: float
-    scheduled_occurrence_iso: str = ""
+                try:
+                    with winreg.OpenKey(network_key, drive_letter) as drive_key:
+                        remote_path, _ = winreg.QueryValueEx(drive_key, "RemotePath")
+                except OSError:
+                    continue
+
+                remote_value = str(remote_path).strip()
+                if remote_value:
+                    drives[f"{drive_letter}:"] = remote_value
+    except Exception:
+        return drives
+
+    return drives
 
 
-@dataclass
-class PlannedFile:
-    source_path: str
-    destination_path: str
-    size_bytes: int
+def connect_mapped_drive_for_current_token(drive: str, remote_path: str) -> tuple[bool, str]:
+    """Attach one mapped drive inside the current process token.
 
+    This is mainly needed when the app is elevated. The normal user token can see
+    F:, G:, etc., while the elevated token often cannot. Calling
+    WNetAddConnection2W recreates the same drive mapping in the elevated token so
+    the native Windows folder picker can display it.
+    """
+    if os.name != "nt":
+        return False, "Mapped drive restoration is only supported on Windows."
 
-@dataclass
-class BackupPlan:
-    commands: list[list[str]]
-    files_to_copy: list[PlannedFile]
-    delete_candidates: int
-    summary_lines: list[str]
+    drive_value = str(drive).strip().rstrip("\\/").upper()
+    remote_value = str(remote_path).strip()
+    if not re.fullmatch(r"[A-Z]:", drive_value) or not remote_value:
+        return False, "Invalid mapped drive information."
 
-
-@dataclass
-class PathValidationResult:
-    ok: bool
-    title: str
-    message: str
-
-
-class InMemoryLogger:
-    def __init__(self, max_entries: int = 5000) -> None:
-        self.max_entries = max_entries
-        self.entries: list[str] = []
-        self.lock = threading.Lock()
-
-    def log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
-        entry = f"[{timestamp}] {message}"
-        with self.lock:
-            self.entries.append(entry)
-            if len(self.entries) > self.max_entries:
-                self.entries = self.entries[-self.max_entries :]
-
-    def get_text(self) -> str:
-        with self.lock:
-            return "\n".join(self.entries)
-
-
-class ConfigStore:
-    @staticmethod
-    def save_config(config: AppConfig, path: str | None = None) -> str:
-        if not path:
-            safe_name = re.sub(r"[^A-Za-z0-9._ -]+", "_", config.config_name.strip() or "backup_job")
-            path = str(CONFIG_DIR / f"{safe_name}.json")
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        config.saved_path = str(Path(path).resolve())
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(config.to_json(), fh, indent=2)
-        return str(Path(path).resolve())
-
-    @staticmethod
-    def load_config(path: str) -> AppConfig:
-        with open(path, "r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        config = AppConfig.from_json(payload)
-        config.saved_path = str(Path(path).resolve())
-        return config
-
-
-WEEKDAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-SHORT_WEEKDAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-
-def format_schedule_display_date(date_value: datetime | None) -> str:
-    if date_value is None:
-        return "Not set"
-    return f"{WEEKDAY_NAMES[date_value.weekday()]} {date_value.strftime('%B')} {date_value.day}/{date_value.year}"
-
-
-def next_monthly_pattern_date(schedule: ScheduleSettings, reference: datetime | None = None) -> datetime | None:
-    base_date = reference or datetime.now()
-    year = base_date.year
-    month = base_date.month
-    for _ in range(24):
-        candidate = nth_weekday_of_month(year, month, schedule.monthly_weekday, schedule.monthly_week_index)
-        if candidate is not None and candidate.date() >= base_date.date():
-            return candidate
-        month += 1
-        if month > 12:
-            month = 1
-            year += 1
-    return None
-
-
-def ordinal_label(value: int) -> str:
-    if value == -1:
-        return "Last"
-    mapping = {1: "1st", 2: "2nd", 3: "3rd", 4: "4th", 5: "5th"}
-    return mapping.get(value, f"{value}th")
-
-
-def parse_anchor_date(value: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(str(value))
+        if os.path.exists(drive_value + "\\"):
+            return True, "Already available."
+    except OSError:
+        pass
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class NETRESOURCEW(ctypes.Structure):
+            _fields_ = [
+                ("dwScope", wintypes.DWORD),
+                ("dwType", wintypes.DWORD),
+                ("dwDisplayType", wintypes.DWORD),
+                ("dwUsage", wintypes.DWORD),
+                ("lpLocalName", wintypes.LPWSTR),
+                ("lpRemoteName", wintypes.LPWSTR),
+                ("lpComment", wintypes.LPWSTR),
+                ("lpProvider", wintypes.LPWSTR),
+            ]
+
+        RESOURCETYPE_DISK = 0x00000001
+        ERROR_SUCCESS = 0
+        ERROR_ALREADY_ASSIGNED = 85
+        ERROR_DEVICE_ALREADY_REMEMBERED = 1202
+
+        net_resource = NETRESOURCEW()
+        net_resource.dwType = RESOURCETYPE_DISK
+        net_resource.lpLocalName = drive_value
+        net_resource.lpRemoteName = remote_value
+
+        result = ctypes.windll.mpr.WNetAddConnection2W(
+            ctypes.byref(net_resource),
+            None,
+            None,
+            0,
+        )
+        if result in (ERROR_SUCCESS, ERROR_ALREADY_ASSIGNED, ERROR_DEVICE_ALREADY_REMEMBERED):
+            return True, "Mapped drive attached."
+
+        buffer = ctypes.create_unicode_buffer(512)
+        ctypes.windll.kernel32.FormatMessageW(
+            0x00001000,
+            None,
+            result,
+            0,
+            buffer,
+            len(buffer),
+            None,
+        )
+        message = buffer.value.strip() or f"Windows error {result}"
+        return False, message
+    except Exception as exc:
+        return False, str(exc)
+
+
+def ensure_persistent_mapped_drives_for_current_token() -> list[tuple[str, str, bool, str]]:
+    """Try to make persistent mapped drives visible to this process token."""
+    results: list[tuple[str, str, bool, str]] = []
+    if os.name != "nt":
+        return results
+
+    for drive, remote_path in list_persistent_mapped_drives().items():
+        ok, message = connect_mapped_drive_for_current_token(drive, remote_path)
+        results.append((drive, remote_path, ok, message))
+    return results
+
+
+def get_persistent_mapped_drive_remote_path(drive: str) -> str | None:
+    if os.name != "nt":
+        return None
+
+    drive_value = str(drive).strip()
+    if not drive_value:
+        return None
+
+    if len(drive_value) > 2:
+        drive_value, _ = os.path.splitdrive(os.path.abspath(drive_value))
+
+    drive_letter = drive_value.rstrip(":\\/").upper()
+    if len(drive_letter) != 1 or not drive_letter.isalpha():
+        return None
+
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Network\{drive_letter}") as key:
+            remote_path, _ = winreg.QueryValueEx(key, "RemotePath")
+        resolved = str(remote_path).strip()
+        return resolved or None
     except Exception:
         return None
-
-
-def nth_weekday_of_month(year: int, month: int, weekday: int, occurrence: int) -> datetime | None:
-    import calendar
-
-    month_calendar = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
-    candidates = [day for week in month_calendar for day in week if day.month == month and day.weekday() == weekday]
-    if not candidates:
-        return None
-    if occurrence == -1:
-        return datetime.combine(candidates[-1], datetime.min.time())
-    index = max(0, occurrence - 1)
-    if index >= len(candidates):
-        return None
-    return datetime.combine(candidates[index], datetime.min.time())
-
-
-def get_monthly_pattern_for_date(date_value: datetime) -> tuple[int, int]:
-    import calendar
-
-    month_calendar = calendar.Calendar(firstweekday=0).monthdatescalendar(date_value.year, date_value.month)
-    matching_days = [day for week in month_calendar for day in week if day.month == date_value.month and day.weekday() == date_value.weekday()]
-    for index, candidate in enumerate(matching_days, start=1):
-        if candidate.day == date_value.day:
-            if index == len(matching_days):
-                return -1, date_value.weekday()
-            return index, date_value.weekday()
-    return 1, date_value.weekday()
-
-
-def sunday_week_start(date_value: datetime) -> datetime:
-    return date_value - timedelta(days=(date_value.weekday() + 1) % 7)
-
-
-def get_sunday_week_index_for_date(date_value: datetime) -> int:
-    import calendar
-
-    month_rows = calendar.Calendar(firstweekday=6).monthdayscalendar(date_value.year, date_value.month)
-    for week_index, week in enumerate(month_rows, start=1):
-        if date_value.day in week:
-            return week_index
-    return 1
-
-
-class ScheduleCalculator:
-    @staticmethod
-    def _time_parts(schedule: ScheduleSettings) -> tuple[int, int]:
-        return schedule.to_24_hour()
-
-    @staticmethod
-    def _weekly_pattern_candidates_for_month(patterns: dict[str, int], year: int, month: int, hour: int, minute: int) -> list[datetime]:
-        import calendar
-
-        candidates: list[datetime] = []
-        month_rows = calendar.Calendar(firstweekday=6).monthdayscalendar(year, month)
-        for week_index, week in enumerate(month_rows, start=1):
-            target_weekday = patterns.get(str(week_index))
-            if target_weekday is None:
-                continue
-            for day_number in week:
-                if day_number == 0:
-                    continue
-                candidate = datetime(year, month, day_number, hour, minute)
-                if candidate.weekday() == target_weekday:
-                    candidates.append(candidate)
-                    break
-        return sorted(candidates)
-
-    @classmethod
-    def previous_occurrence(cls, schedule: ScheduleSettings, now: datetime) -> datetime | None:
-        if not schedule.enabled:
-            return None
-        hour, minute = cls._time_parts(schedule)
-
-        if schedule.schedule_type == "daily":
-            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if candidate > now:
-                candidate -= timedelta(days=1)
-            return candidate
-
-        if schedule.schedule_type == "weekly":
-            if schedule.weekly_patterns:
-                for months_back in range(0, 24):
-                    probe = (now.replace(day=15) - timedelta(days=32 * months_back)).replace(day=1)
-                    candidates = cls._weekly_pattern_candidates_for_month(schedule.weekly_patterns, probe.year, probe.month, hour, minute)
-                    valid = [candidate for candidate in candidates if candidate <= now]
-                    if valid:
-                        return valid[-1]
-                return None
-            selected = sorted(set(schedule.weekdays or [0]))
-            for days_back in range(0, 8):
-                candidate = (now - timedelta(days=days_back)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if candidate.weekday() in selected and candidate <= now:
-                    return candidate
-            return None
-
-        if schedule.schedule_type == "biweekly":
-            anchor = parse_anchor_date(schedule.biweekly_anchor_iso)
-            if anchor is None:
-                return None
-            candidate = anchor.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            while candidate > now:
-                candidate -= timedelta(days=14)
-            while candidate + timedelta(days=14) <= now:
-                candidate += timedelta(days=14)
-            return candidate
-
-        if schedule.schedule_type == "monthly":
-            for months_back in range(0, 24):
-                probe = (now.replace(day=15) - timedelta(days=32 * months_back)).replace(day=1)
-                candidate_date = nth_weekday_of_month(probe.year, probe.month, schedule.monthly_weekday, schedule.monthly_week_index)
-                if candidate_date is None:
-                    continue
-                candidate = candidate_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if candidate <= now:
-                    return candidate
-            return None
-
-        return None
-
-    @classmethod
-    def next_occurrence(cls, schedule: ScheduleSettings, after_dt: datetime) -> datetime | None:
-        if not schedule.enabled:
-            return None
-        hour, minute = cls._time_parts(schedule)
-
-        if schedule.schedule_type == "daily":
-            candidate = after_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if candidate <= after_dt:
-                candidate += timedelta(days=1)
-            return candidate
-
-        if schedule.schedule_type == "weekly":
-            if schedule.weekly_patterns:
-                for months_forward in range(0, 24):
-                    probe = (after_dt.replace(day=15) + timedelta(days=32 * months_forward)).replace(day=1)
-                    candidates = cls._weekly_pattern_candidates_for_month(schedule.weekly_patterns, probe.year, probe.month, hour, minute)
-                    for candidate in candidates:
-                        if candidate > after_dt:
-                            return candidate
-                return None
-            selected = sorted(set(schedule.weekdays or [0]))
-            for days_forward in range(0, 15):
-                candidate = (after_dt + timedelta(days=days_forward)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if candidate.weekday() in selected and candidate > after_dt:
-                    return candidate
-            return None
-
-        if schedule.schedule_type == "biweekly":
-            anchor = parse_anchor_date(schedule.biweekly_anchor_iso)
-            if anchor is None:
-                return None
-            candidate = anchor.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            while candidate <= after_dt:
-                candidate += timedelta(days=14)
-            return candidate
-
-        if schedule.schedule_type == "monthly":
-            for months_forward in range(0, 24):
-                probe = (after_dt.replace(day=15) + timedelta(days=32 * months_forward)).replace(day=1)
-                candidate_date = nth_weekday_of_month(probe.year, probe.month, schedule.monthly_weekday, schedule.monthly_week_index)
-                if candidate_date is None:
-                    continue
-                candidate = candidate_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                if candidate > after_dt:
-                    return candidate
-            return None
-
-        return None
-
-
-def normalize_path(path: str) -> str:
-    return os.path.normcase(os.path.normpath(path))
 
 
 def resolve_windows_mapped_drive(path: str) -> str | None:
     if os.name != "nt":
         return None
+
+    drive, _ = os.path.splitdrive(os.path.abspath(path))
+    if not drive:
+        return None
+
     try:
         import ctypes
         from ctypes import wintypes
 
-        drive, _ = os.path.splitdrive(os.path.abspath(path))
-        if not drive:
-            return None
-
         remote_name = ctypes.create_unicode_buffer(2048)
         buffer_size = wintypes.DWORD(len(remote_name))
         result = ctypes.windll.mpr.WNetGetConnectionW(drive, remote_name, ctypes.byref(buffer_size))
-        if result != 0:
-            return None
-        resolved = str(remote_name.value).strip()
-        return resolved or None
+        if result == 0:
+            resolved = str(remote_name.value).strip()
+            if resolved:
+                return resolved
     except Exception:
-        return None
+        pass
+
+    return get_persistent_mapped_drive_remote_path(drive)
+
+
+def resolve_mapped_path_for_current_token(path: str) -> str:
+    raw_value = str(path).strip()
+    if os.name != "nt" or not raw_value:
+        return raw_value
+
+    normalized = raw_value.replace("/", "\\")
+    drive, tail = os.path.splitdrive(normalized)
+    if not drive:
+        return raw_value
+
+    drive_root = drive + "\\"
+    try:
+        if os.path.exists(drive_root):
+            return raw_value
+    except OSError:
+        pass
+
+    remote_root = resolve_windows_mapped_drive(raw_value)
+    if not remote_root:
+        return raw_value
+
+    relative_tail = tail.lstrip("\\/")
+    resolved_path = remote_root.rstrip("\\/")
+    if relative_tail:
+        resolved_path = resolved_path + "\\" + relative_tail.replace("/", "\\")
+    return os.path.normpath(resolved_path)
+
+
+def display_path_for_original_mapping(original_path: str, actual_path: str) -> str:
+    """Return the user-facing mapped-drive path when an elevated token resolved it to UNC."""
+    original_value = str(original_path).strip()
+    actual_value = str(actual_path).strip()
+    if os.name != "nt" or not original_value or not actual_value:
+        return actual_value
+
+    normalized_original = original_value.replace("/", "\\")
+    drive, _tail = os.path.splitdrive(normalized_original)
+    if not drive:
+        return actual_value
+
+    remote_root = resolve_windows_mapped_drive(original_value)
+    if not remote_root:
+        return actual_value
+
+    remote_root = os.path.normpath(remote_root).rstrip("\\/")
+    actual_normalized = os.path.normpath(actual_value)
+    remote_check = normalize_path(remote_root)
+    actual_check = normalize_path(actual_normalized)
+
+    if actual_check == remote_check:
+        return os.path.normpath(drive + "\\")
+
+    prefix = remote_check.rstrip("\\") + "\\"
+    if not actual_check.startswith(prefix):
+        return actual_value
+
+    relative_tail = actual_normalized[len(remote_root):].lstrip("\\/")
+    display_path = drive + "\\"
+    if relative_tail:
+        display_path += relative_tail
+    return os.path.normpath(display_path)
+
+
+def path_matches_requested_destination(requested_path: str, existing_path: str) -> bool:
+    if normalize_path(existing_path) == normalize_path(requested_path):
+        return True
+
+    resolved_requested_path = resolve_mapped_path_for_current_token(requested_path)
+    return normalize_path(existing_path) == normalize_path(resolved_requested_path)
 
 
 def is_remote_path(path: str) -> bool:
@@ -869,31 +446,46 @@ def find_nearest_existing_path(path: str) -> str | None:
     if not value:
         return None
 
-    candidate = os.path.normpath(value)
-    visited: set[str] = set()
+    candidates = [os.path.normpath(value)]
+    resolved_candidate = resolve_mapped_path_for_current_token(value)
+    if resolved_candidate and normalize_path(resolved_candidate) != normalize_path(value):
+        candidates.append(os.path.normpath(resolved_candidate))
 
-    while candidate and candidate not in visited:
-        try:
-            if os.path.exists(candidate):
-                return candidate
-        except OSError:
-            return None
+    for starting_candidate in candidates:
+        candidate = starting_candidate
+        visited: set[str] = set()
 
-        visited.add(candidate)
-        stripped_candidate = candidate.rstrip("\\/")
-        parent = os.path.dirname(stripped_candidate) if stripped_candidate else ""
-        if not parent or parent == candidate:
-            break
-        candidate = parent
+        while candidate and candidate not in visited:
+            try:
+                if os.path.exists(candidate):
+                    return candidate
+            except OSError:
+                break
+
+            visited.add(candidate)
+            stripped_candidate = candidate.rstrip("\\/")
+            parent = os.path.dirname(stripped_candidate) if stripped_candidate else ""
+            if not parent or parent == candidate:
+                break
+            candidate = parent
 
     network_details = get_network_path_details(value)
     if network_details is not None:
-        _, _, share_root = network_details
-        try:
-            if os.path.exists(share_root):
-                return share_root
-        except OSError:
-            return None
+        _, _, network_path = network_details
+        network_candidate = network_path
+
+        while network_candidate:
+            try:
+                if os.path.exists(network_candidate):
+                    return network_candidate
+            except OSError:
+                break
+
+            stripped_network_candidate = network_candidate.rstrip("\\/")
+            parent = os.path.dirname(stripped_network_candidate) if stripped_network_candidate else ""
+            if not parent or parent == network_candidate:
+                break
+            network_candidate = parent
 
     try:
         drive, _ = os.path.splitdrive(os.path.abspath(value))
@@ -909,7 +501,6 @@ def find_nearest_existing_path(path: str) -> str | None:
             return None
 
     return None
-
 
 def probe_path_access(path: str) -> tuple[bool, str]:
     try:
@@ -981,7 +572,8 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
         if nearest_existing_path:
             access_ok, access_message = probe_path_access(nearest_existing_path)
             if access_ok:
-                nearest_is_target = normalize_path(nearest_existing_path) == normalize_path(raw_value)
+                nearest_is_target = path_matches_requested_destination(raw_value, nearest_existing_path)
+                display_existing_path = display_path_for_original_mapping(raw_value, nearest_existing_path)
                 if nearest_is_target:
                     if ping_ok:
                         message = (
@@ -1003,14 +595,14 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
                         message = (
                             "Network path is reachable.\n\n"
                             f"Requested Destination: {raw_value}\n"
-                            f"Accessible Parent/Share: {nearest_existing_path}\n\n"
+                            f"Accessible Parent/Share: {display_existing_path}\n\n"
                             "The exact destination folder does not exist yet, but the reachable network path can be used and Robocopy can create the missing folder when the backup runs."
                         )
                     else:
                         message = (
                             "Network path is reachable.\n\n"
                             f"Requested Destination: {raw_value}\n"
-                            f"Accessible Parent/Share: {nearest_existing_path}\n\n"
+                            f"Accessible Parent/Share: {display_existing_path}\n\n"
                             "The server did not answer ping, but the network path itself is accessible and Robocopy can create the missing folder when the backup runs."
                         )
 
@@ -1019,17 +611,18 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
             failure_message = (
                 "Network destination was found, but it could not be opened.\n\n"
                 f"Requested Destination: {raw_value}\n"
-                f"Resolved Path: {nearest_existing_path}\n"
+                f"Resolved Path: {display_path_for_original_mapping(raw_value, nearest_existing_path)}\n"
                 f"Access Error: {access_message}"
             )
             return PathValidationResult(ok=False, title="Test Network Path", message=failure_message)
 
+        display_share_root = display_path_for_original_mapping(raw_value, share_root)
         if ping_ok:
             message = (
                 "Network server responded, but the destination path could not be reached.\n\n"
                 f"Requested Destination: {raw_value}\n"
                 f"Server: {server}\n"
-                f"Share Root Checked: {share_root}\n\n"
+                f"Share Root Checked: {display_share_root}\n\n"
                 "Make sure the share and folder exist and that your account has access."
             )
         else:
@@ -1038,7 +631,7 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
                 "Network destination is unreachable.\n\n"
                 f"Requested Destination: {raw_value}\n"
                 f"Server: {server}\n"
-                f"Share Root Checked: {share_root}\n\n"
+                f"Share Root Checked: {display_share_root}\n\n"
                 "The server did not answer ping and the share could not be opened."
                 f"{extra}"
             )
@@ -1060,7 +653,8 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
     if nearest_existing_path:
         access_ok, access_message = probe_path_access(nearest_existing_path)
         if access_ok:
-            nearest_is_target = normalize_path(nearest_existing_path) == normalize_path(raw_value)
+            nearest_is_target = path_matches_requested_destination(raw_value, nearest_existing_path)
+            display_existing_path = display_path_for_original_mapping(raw_value, nearest_existing_path)
             if nearest_is_target:
                 message = (
                     "Destination path is reachable.\n\n"
@@ -1070,7 +664,7 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
                 message = (
                     "Destination parent path is reachable.\n\n"
                     f"Requested Destination: {raw_value}\n"
-                    f"Accessible Parent: {nearest_existing_path}\n\n"
+                    f"Accessible Parent: {display_existing_path}\n\n"
                     "The exact destination folder does not exist yet, but the available parent path can be used and Robocopy can create the missing folder when the backup runs."
                 )
             return PathValidationResult(ok=True, title="Test Network Path", message=message)
@@ -1081,7 +675,7 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
             message=(
                 "Destination path was found, but it could not be opened.\n\n"
                 f"Requested Destination: {raw_value}\n"
-                f"Resolved Path: {nearest_existing_path}\n"
+                f"Resolved Path: {display_path_for_original_mapping(raw_value, nearest_existing_path)}\n"
                 f"Access Error: {access_message}"
             ),
         )
@@ -1097,118 +691,55 @@ def validate_backup_destination_path(destination: str) -> PathValidationResult:
     )
 
 
-def is_same_or_newer(src_path: str, dest_path: str) -> bool:
-    if not os.path.exists(dest_path):
-        return False
-    try:
-        src_stat = os.stat(src_path)
-        dest_stat = os.stat(dest_path)
-    except OSError:
-        return False
-    same_size = src_stat.st_size == dest_stat.st_size
-    close_time = abs(src_stat.st_mtime - dest_stat.st_mtime) <= FFT_SECONDS
-    return same_size and close_time
-
-
 class BackupPlanBuilder:
-    @staticmethod
-    def _copy_folder_command(source_dir: str, destination_dir: str, mirror: bool) -> list[str]:
-        command = [
-            "robocopy",
-            source_dir,
-            destination_dir,
-            "/E" if not mirror else "/MIR",
-            "/R:2",
-            "/W:3",
-            "/ZB",
-            "/FFT",
-            "/XJ",
-            "/COPY:DAT",
-            "/DCOPY:DAT",
-            "/BYTES",
-            "/FP",
-            "/NP",
-            "/TEE",
-            "/NJH",
-            "/NJS",
-        ]
-        return command
-
-    @staticmethod
-    def _copy_file_command(source_file: str, destination_root: str) -> list[str]:
-        source_parent = str(Path(source_file).parent)
-        filename = Path(source_file).name
-        return [
-            "robocopy",
-            source_parent,
-            destination_root,
-            filename,
-            "/R:2",
-            "/W:3",
-            "/ZB",
-            "/FFT",
-            "/COPY:DAT",
-            "/BYTES",
-            "/FP",
-            "/NP",
-            "/TEE",
-            "/NJH",
-            "/NJS",
-        ]
-
     @classmethod
     def build_plan(cls, config: AppConfig) -> BackupPlan:
-        destination_root = config.destination.strip()
-        if not destination_root:
+        configured_destination_root = config.destination.strip()
+        if not configured_destination_root:
             raise ValueError("Destination path is required.")
         if not config.sources:
             raise ValueError("At least one source file or folder is required.")
+
+        mode = normalize_backup_mode(config.mode)
+        destination_root = resolve_mapped_path_for_current_token(configured_destination_root)
 
         commands: list[list[str]] = []
         files_to_copy: list[PlannedFile] = []
         delete_candidates = 0
         summary: list[str] = []
 
+        if normalize_path(destination_root) != normalize_path(configured_destination_root):
+            summary.append(f"Effective destination path -> {destination_root}")
+
         for source in config.sources:
             source_path = Path(source)
             if not source_path.exists():
                 raise ValueError(f"Source path does not exist: {source}")
 
-            if source_path.is_file():
-                if config.mode == "Mirror":
-                    raise ValueError(
-                        "Mirror mode is folder-only in this first version. Remove file sources or switch to Copy/Instant Sync."
-                    )
-                destination_path = str(Path(destination_root) / source_path.name)
-                if not is_same_or_newer(str(source_path), destination_path):
-                    size_bytes = source_path.stat().st_size
-                    files_to_copy.append(PlannedFile(str(source_path), destination_path, size_bytes))
-                commands.append(cls._copy_file_command(str(source_path), destination_root))
-                summary.append(f"File -> {source_path.name} -> {destination_root}")
+            if mode == MODE_MIRROR:
+                delete_candidates += append_mirror_source_to_plan(
+                    source_path=source_path,
+                    destination_root=destination_root,
+                    commands=commands,
+                    files_to_copy=files_to_copy,
+                    summary=summary,
+                )
                 continue
 
-            destination_dir = str(Path(destination_root) / source_path.name)
-            commands.append(cls._copy_folder_command(str(source_path), destination_dir, config.mode == "Mirror"))
-            summary.append(f"Folder -> {source_path.name} -> {destination_dir}")
+            append_copy_source_to_plan(
+                source_path=source_path,
+                destination_root=destination_root,
+                commands=commands,
+                files_to_copy=files_to_copy,
+                summary=summary,
+            )
 
-            for root, _, files in os.walk(source_path):
-                for file_name in files:
-                    source_file = Path(root) / file_name
-                    rel_path = source_file.relative_to(source_path)
-                    dest_file = Path(destination_dir) / rel_path
-                    if not is_same_or_newer(str(source_file), str(dest_file)):
-                        files_to_copy.append(PlannedFile(str(source_file), str(dest_file), source_file.stat().st_size))
-
-            if config.mode == "Mirror" and Path(destination_dir).exists():
-                source_relatives = set()
-                for root, _, files in os.walk(source_path):
-                    for file_name in files:
-                        source_relatives.add(str((Path(root) / file_name).relative_to(source_path)).lower())
-                for root, _, files in os.walk(destination_dir):
-                    for file_name in files:
-                        rel_dest = str((Path(root) / file_name).relative_to(destination_dir)).lower()
-                        if rel_dest not in source_relatives:
-                            delete_candidates += 1
+        if mode != MODE_MIRROR:
+            for command in commands:
+                if find_destructive_robocopy_switches(command):
+                    raise ValueError(
+                        "Unsafe Robocopy command blocked. Copy mode cannot run /MIR or /PURGE."
+                    )
 
         return BackupPlan(
             commands=commands,
@@ -1217,10 +748,9 @@ class BackupPlanBuilder:
             summary_lines=summary,
         )
 
-
 class BackupWorker(threading.Thread):
     FILE_ACTION_RE = re.compile(
-        r"^\s*(?:New File|Newer|Older|Changed|Same|Tweaked|Modified)\s+\d+\s+(.+)$",
+        r"^\s*(New File|Newer|Older|Changed|Same|Tweaked|Modified)\s+\d+\s+(.+)$",
         re.IGNORECASE,
     )
     EXTRA_RE = re.compile(r"^\s*(?:\*?EXTRA File|\*?EXTRA Dir)\s+(.+)$", re.IGNORECASE)
@@ -1496,23 +1026,43 @@ class BackupWorker(threading.Thread):
         self.rate_monitor_stop.clear()
         self._set_live_rate(0.0)
 
+    def _validate_robocopy_command_safety(self, command: list[str]) -> None:
+        mode = normalize_backup_mode(self.config.mode)
+        if mode == MODE_MIRROR:
+            return
+
+        destructive_switches = find_destructive_robocopy_switches(command)
+        if destructive_switches:
+            switch_list = ", ".join(destructive_switches)
+            raise RuntimeError(
+                f"Unsafe Robocopy command blocked. {mode} mode cannot run destructive switch(es): {switch_list}"
+            )
+
     def _handle_output_line(self, line: str) -> None:
         clean = line.rstrip()
         if not clean:
             return
-        self.logger.log(clean)
 
         extra_match = self.EXTRA_RE.match(clean)
         if extra_match:
-            self.status_line = f"Mirror cleanup: {extra_match.group(1).strip()}"
-            self.message_queue.put(("status", self.status_line))
+            if is_mirror_mode(self.config.mode):
+                self.logger.log(clean)
+                extra_path = extra_match.group(1).strip()
+                self.status_line = f"Mirror cleanup: {extra_path}"
+                self.message_queue.put(("status", self.status_line))
             return
 
         match = self.FILE_ACTION_RE.match(clean)
         if not match:
+            self.logger.log(clean)
             return
 
-        source_display_path = match.group(1).strip()
+        action = match.group(1).strip().lower()
+        if action in {"same", "older"}:
+            return
+
+        self.logger.log(clean)
+        source_display_path = match.group(2).strip()
         source_path = normalize_path(source_display_path)
         self.active_source_path = source_display_path
         self.active_destination_path = self.source_to_destination_map.get(source_path, "")
@@ -1524,7 +1074,8 @@ class BackupWorker(threading.Thread):
             self._push_progress(f"Copying From: {source_display_path}")
 
     def run(self) -> None:
-        self.logger.log(f"Starting job in {self.config.mode} mode.")
+        mode = normalize_backup_mode(self.config.mode)
+        self.logger.log(f"Starting job in {mode} mode.")
         for summary in self.plan.summary_lines:
             self.logger.log(summary)
 
@@ -1533,7 +1084,7 @@ class BackupWorker(threading.Thread):
             return
 
         if self.total_bytes == 0:
-            self._push_progress("No file changes detected. Robocopy verification pass running.")
+            self._push_progress("Copying...")
 
         try:
             for command in self.plan.commands:
@@ -1542,6 +1093,7 @@ class BackupWorker(threading.Thread):
                     self.message_queue.put(("completed", {"stopped": True, "had_work": True}))
                     return
 
+                self._validate_robocopy_command_safety(command)
                 self.logger.log("Executing: " + " ".join(f'"{part}"' if " " in part else part for part in command))
                 if len(command) > 1:
                     self.status_line = f"Copying From: {command[1]}"
@@ -1596,74 +1148,6 @@ class BackupWorker(threading.Thread):
 
 
 
-class InstaSyncHandler(FileSystemEventHandler):
-    def __init__(self, callback) -> None:  # type: ignore[no-untyped-def]
-        super().__init__()
-        self.callback = callback
-
-    def on_any_event(self, event) -> None:  # type: ignore[override]
-        if getattr(event, "is_directory", False):
-            return
-        self.callback()
-
-
-class InstaSyncWatcher:
-    def __init__(self, app: "BackupManagerApp") -> None:
-        self.app = app
-        self.observer = None
-        self.debounce_timer: threading.Timer | None = None
-        self.lock = threading.Lock()
-        self.pending_after_run = False
-
-    def start(self, source_paths: list[str]) -> bool:
-        self.stop()
-        if Observer is None:
-            self.app.logger.log("watchdog is not installed. Sync cannot watch for file system changes.")
-            return False
-
-        watch_roots: set[str] = set()
-        for source in source_paths:
-            path = Path(source)
-            if path.is_dir():
-                watch_roots.add(str(path))
-            elif path.is_file():
-                watch_roots.add(str(path.parent))
-
-        if not watch_roots:
-            return False
-
-        self.observer = Observer()
-        handler = InstaSyncHandler(self.on_file_event)
-        for root in sorted(watch_roots):
-            self.observer.schedule(handler, root, recursive=True)
-            self.app.logger.log(f"Watching for changes: {root}")
-        self.observer.start()
-        return True
-
-    def stop(self) -> None:
-        with self.lock:
-            if self.debounce_timer is not None:
-                self.debounce_timer.cancel()
-                self.debounce_timer = None
-        if self.observer is not None:
-            try:
-                self.observer.stop()
-                self.observer.join(timeout=2.0)
-            except Exception:
-                pass
-            self.observer = None
-
-    def on_file_event(self) -> None:
-        self.app.logger.log("Sync file change detected.")
-        with self.lock:
-            if self.debounce_timer is not None:
-                self.debounce_timer.cancel()
-            self.debounce_timer = threading.Timer(QUIET_PERIOD_SECONDS, self._debounce_complete)
-            self.debounce_timer.daemon = True
-            self.debounce_timer.start()
-
-    def _debounce_complete(self) -> None:
-        self.app.root.after(0, self.app.handle_insta_sync_debounce_complete)
 
 
 class ManagedPopout(Toplevel):
@@ -2074,6 +1558,7 @@ class SourceDialog(ManagedPopout):
             self.parent.configure_insta_sync_watcher()
 
     def _add_folder(self) -> None:
+        self.parent.prepare_mapped_drives_for_browse()
         path = filedialog.askdirectory(parent=self)
         if path:
             self.listbox.insert(END, path)
@@ -2165,22 +1650,6 @@ def center_window(window, width: int, height: int) -> None:  # type: ignore[no-u
     window.geometry(f"{width}x{height}+{x}+{y}")
 
 
-def normalize_startup_delay_label(value) -> str:  # type: ignore[no-untyped-def]
-    if isinstance(value, str):
-        normalized = value.strip()
-        if normalized in STARTUP_DELAY_OPTIONS:
-            return normalized
-        stripped = normalized.lower().replace(" ", "")
-        if stripped.endswith("s") and stripped[:-1].isdigit():
-            seconds = int(stripped[:-1])
-            return SECONDS_TO_STARTUP_DELAY_LABEL.get(seconds, "Off")
-        if stripped.isdigit():
-            seconds = int(stripped)
-            return SECONDS_TO_STARTUP_DELAY_LABEL.get(seconds, "Off")
-    elif isinstance(value, (int, float)):
-        return SECONDS_TO_STARTUP_DELAY_LABEL.get(int(value), "Off")
-    return "Off"
-
 
 class BackupManagerApp:
     def __init__(self) -> None:
@@ -2222,6 +1691,7 @@ class BackupManagerApp:
         self.paused_interrupted_notice_shown = False
         self.is_in_tray = False
         self.active_popouts: dict[str, ManagedPopout] = {}
+        self.progress_reset_after_id: str | None = None
 
         self.config_name_var = StringVar()
         self.destination_var = StringVar()
@@ -2232,6 +1702,7 @@ class BackupManagerApp:
         self.close_to_tray_var = BooleanVar(value=False)
         self.run_missed_schedule_at_startup_var = BooleanVar(value=False)
         self.startup_delay_var = StringVar(value="Off")
+        self.startup_run_as_admin_var = StringVar(value="Disabled")
         self.progress_var = IntVar(value=0)
         self.progress_label_var = StringVar(value="0 %")
         self.current_file_var = StringVar(value="Ready")
@@ -2243,7 +1714,12 @@ class BackupManagerApp:
         self.schedule_summary_var = StringVar(value="No schedule set")
         self.source_summary_var = StringVar(value="0 source items selected")
 
+        self.pending_startup_task_admin_refresh = STARTUP_ADMIN_APPLY_TASK_ARGUMENT in sys.argv
+
         self._load_app_settings()
+        self._ensure_run_as_admin_session(reason="Launch")
+        self._apply_pending_startup_task_admin_refresh()
+        self._sync_startup_task_settings_from_task()
         self.startup_processing_ready = not self._should_delay_startup_processing()
         if self.start_minimized_to_tray_var.get() and pystray is not None and Image is not None and ImageDraw is not None:
             self.root.withdraw()
@@ -2270,10 +1746,7 @@ class BackupManagerApp:
             self.root.after(0, self.hide_to_tray_if_available)
 
     def _load_metadata(self) -> AppMetadata:
-        try:
-            return load_app_metadata()
-        except AppMetadataError:
-            return DEFAULT_METADATA
+        return load_app_metadata()
 
     def _configure_style(self) -> None:
         try:
@@ -2369,15 +1842,24 @@ class BackupManagerApp:
 
     def _apply_window_icon(self) -> None:
         try:
-            png_candidates = self._icon_candidates("jbh_backup_manager.png")
             ico_candidates = self._icon_candidates("jbh_backup_manager.ico")
-            png_path = next((candidate for candidate in png_candidates if candidate.exists()), None)
+            png_candidates = self._icon_candidates("jbh_backup_manager.png", "jbh_backup_manager_256.png")
+
             ico_path = next((candidate for candidate in ico_candidates if candidate.exists()), None)
+            png_path = next((candidate for candidate in png_candidates if candidate.exists()), None)
+
+            if os.name == "nt" and ico_path is not None:
+                try:
+                    self.root.iconbitmap(str(ico_path))
+                except Exception:
+                    self.root.wm_iconbitmap(default=str(ico_path))
+
             if png_path is not None:
                 self.window_icon_image = PhotoImage(file=str(png_path))
                 self.root.iconphoto(True, self.window_icon_image)
-            elif os.name == "nt" and ico_path is not None:
-                self.root.iconbitmap(default=str(ico_path))
+
+            self.root.update_idletasks()
+
         except Exception as exc:
             self.logger.log(f"Window icon could not be applied: {exc}")
 
@@ -2681,6 +2163,15 @@ class BackupManagerApp:
             self.start_with_windows_var,
             self.on_start_with_windows_toggle,
         )
+        self.start_with_windows_tooltip = HoverTooltip(
+            self.root,
+            lambda: self._get_start_with_windows_unavailable_message(),
+            targets=[
+                self.start_with_windows_check.master,
+                self.start_with_windows_check,
+                self.start_with_windows_label,
+            ],
+        )
 
         self.start_minimized_to_tray_check, self.start_minimized_to_tray_label = self._build_settings_check_row(
             settings_inner,
@@ -2710,10 +2201,14 @@ class BackupManagerApp:
 
         startup_delay_row = Frame(settings_inner, bg=CARD_ALT)
         startup_delay_row.grid(row=4, column=0, sticky="ew", pady=(0, 0))
-        startup_delay_row.grid_columnconfigure(0, weight=1)
-        Label(startup_delay_row, text="Delay Startup", bg=CARD_ALT, fg=TEXT, anchor="w").grid(row=0, column=0, sticky="w")
+        startup_delay_row.grid_columnconfigure(0, weight=0)
+        startup_delay_row.grid_columnconfigure(1, weight=1)
+
+        startup_delay_left = Frame(startup_delay_row, bg=CARD_ALT)
+        startup_delay_left.grid(row=0, column=0, sticky="w")
+        Label(startup_delay_left, text="Delay Startup", bg=CARD_ALT, fg=TEXT, anchor="w").grid(row=0, column=0, sticky="w")
         self.startup_delay_combo = ttk.Combobox(
-            startup_delay_row,
+            startup_delay_left,
             textvariable=self.startup_delay_var,
             values=list(STARTUP_DELAY_OPTIONS.keys()),
             state="readonly",
@@ -2721,6 +2216,25 @@ class BackupManagerApp:
         )
         self.startup_delay_combo.grid(row=1, column=0, sticky="w", pady=(4, 0))
         self.startup_delay_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_startup_delay_changed())
+
+        startup_admin_right = Frame(startup_delay_row, bg=CARD_ALT)
+        startup_admin_right.grid(row=0, column=1, sticky="w", padx=(16, 0))
+        Label(
+            startup_admin_right,
+            text="Run As Admin",
+            bg=CARD_ALT,
+            fg=TEXT,
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w")
+        self.startup_run_as_admin_combo = ttk.Combobox(
+            startup_admin_right,
+            textvariable=self.startup_run_as_admin_var,
+            values=list(STARTUP_ADMIN_OPTIONS.keys()),
+            state="readonly",
+            width=10,
+        )
+        self.startup_run_as_admin_combo.grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.startup_run_as_admin_combo.bind("<<ComboboxSelected>>", lambda _e: self.on_startup_run_as_admin_changed())
 
         self.set_controls_for_idle_state()
 
@@ -2755,8 +2269,28 @@ class BackupManagerApp:
             self.progress_canvas.create_rectangle(0, 0, fill_width, height, fill=PROGRESS_FILL, outline=PROGRESS_FILL)
         self.progress_canvas.create_text(width // 2, height // 2, text=self.progress_label_var.get(), fill="white", font=("Segoe UI", 10, "bold"))
 
+    def prepare_mapped_drives_for_browse(self) -> None:
+        if os.name != "nt" or not is_current_process_elevated():
+            return
+
+        for drive, remote_path, ok, message in ensure_persistent_mapped_drives_for_current_token():
+            if ok:
+                self.logger.log(f"Admin browse mapped drive available: {drive}\\ -> {remote_path}")
+            else:
+                self.logger.log(f"Admin browse could not attach mapped drive {drive} -> {remote_path}: {message}")
+
     def choose_destination(self) -> None:
-        path = filedialog.askdirectory(parent=self.root)
+        self.prepare_mapped_drives_for_browse()
+        initial_dir = self.destination_var.get().strip()
+        dialog_options = {"parent": self.root}
+        if initial_dir:
+            try:
+                if os.path.exists(initial_dir):
+                    dialog_options["initialdir"] = initial_dir
+            except OSError:
+                pass
+
+        path = filedialog.askdirectory(**dialog_options)
         if path:
             self.destination_var.set(path)
             self.sync_form_to_config()
@@ -2788,7 +2322,8 @@ class BackupManagerApp:
     def sync_form_to_config(self) -> None:
         self.config.config_name = self.config_name_var.get().strip()
         self.config.destination = self.destination_var.get().strip()
-        self.config.mode = self.mode_var.get().strip()
+        self.config.mode = normalize_backup_mode(self.mode_var.get())
+        self.mode_var.set(self.config.mode)
         self.config.schedule.enabled = bool(self.schedule_enabled_var.get())
         self._write_last_session()
 
@@ -2845,6 +2380,7 @@ class BackupManagerApp:
     def apply_config_to_form(self) -> None:
         self.config_name_var.set(self.config.config_name)
         self.destination_var.set(self.config.destination)
+        self.config.mode = normalize_backup_mode(self.config.mode)
         self.mode_var.set(self.config.mode)
         self.schedule_enabled_var.set(self.config.schedule.enabled)
         self.on_mode_changed(initial=True)
@@ -3091,52 +2627,514 @@ class BackupManagerApp:
         gbps = mbps / 1000.0
         return f"{gbps:.2f} Gbps"
 
-    def _can_enable_start_with_windows(self) -> bool:
+    def _can_enable_start_with_windows_mode(self) -> bool:
         return bool(self.schedule_enabled_var.get() or self.mode_var.get() == MODE_INSTANT_SYNC)
 
-    def _build_startup_command(self) -> str:
+    def _get_start_with_windows_unavailable_message(self) -> str:
+        missing_requirements: list[str] = []
+
+        if not self._can_enable_start_with_windows_mode():
+            missing_requirements.append("Enable Schedule or switch Mode to Instant Sync")
+        if not self._startup_run_as_admin_enabled():
+            missing_requirements.append('set "Run As Admin" to Enabled')
+
+        if not missing_requirements:
+            return ""
+
+        if len(missing_requirements) == 1:
+            return f'{missing_requirements[0]} to use Start With Windows.'
+
+        return f'{", and ".join(missing_requirements)} to use Start With Windows.'
+
+    def _can_enable_start_with_windows(self) -> bool:
+        return self._get_start_with_windows_unavailable_message() == ""
+
+    def _resolve_startup_executable_path(self) -> Path | None:
+        executable_candidates: list[Path] = []
+
         if getattr(sys, "frozen", False):
-            command_parts = [sys.executable, "--startup"]
-        else:
-            command_parts = [sys.executable, str(Path(__file__).resolve()), "--startup"]
-        return subprocess.list2cmdline(command_parts)
+            executable_candidates.append(Path(sys.executable).resolve())
+
+        argv0_path = Path(sys.argv[0]).resolve()
+        if argv0_path.suffix.lower() == ".exe" and argv0_path.exists():
+            executable_candidates.append(argv0_path)
+
+        for candidate in executable_candidates:
+            if candidate.suffix.lower() == ".exe" and candidate.exists():
+                return candidate
+
+        return None
+
+    def _build_startup_launch_parts(self) -> list[str]:
+        startup_executable = self._resolve_startup_executable_path()
+        if startup_executable is not None:
+            return [str(startup_executable), "--startup"]
+
+        raise RuntimeError(
+            "Start With Windows can only be enabled from a compiled .exe build. "
+            "The current session is running from source, so a stable application executable path is not available."
+        )
+
+    def _build_startup_command(self) -> str:
+        return subprocess.list2cmdline(self._build_startup_launch_parts())
+
+    def _build_startup_task_action_details(self) -> tuple[str, str, str]:
+        launch_parts = self._build_startup_launch_parts()
+        executable_path = launch_parts[0]
+        arguments = subprocess.list2cmdline(launch_parts[1:]) if len(launch_parts) > 1 else ""
+        working_directory = str(APP_DIR)
+        return executable_path, arguments, working_directory
+
+    def _get_windows_startup_task_path(self) -> str:
+        return f"{STARTUP_TASK_FOLDER_PATH}\\{STARTUP_TASK_NAME}"
+
+    def _get_powershell_executable(self) -> str:
+        for candidate in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        raise RuntimeError("Windows PowerShell was not found, so the Start With Windows task could not be managed.")
+
+    def _run_powershell(self, script: str, *arguments: str) -> str:
+        temp_script_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                suffix=".ps1",
+                prefix="jbh_startup_task_",
+                dir=str(RUNTIME_DIR),
+                encoding="utf-8",
+                delete=False,
+            ) as handle:
+                handle.write(script)
+                temp_script_path = Path(handle.name)
+
+            command = [
+                self._get_powershell_executable(),
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(temp_script_path),
+                *[str(argument) for argument in arguments],
+            ]
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                creationflags=WINDOWS_CREATE_NO_WINDOW,
+            )
+            return (result.stdout or "").strip()
+        except subprocess.CalledProcessError as exc:
+            error_text = (exc.stderr or exc.stdout or str(exc)).strip()
+            raise RuntimeError(error_text or "PowerShell failed while managing the Start With Windows task.") from exc
+        finally:
+            if temp_script_path is not None:
+                try:
+                    temp_script_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _apply_pending_startup_task_admin_refresh(self) -> None:
+        if not self.pending_startup_task_admin_refresh:
+            return
+
+        self.pending_startup_task_admin_refresh = False
+
+        if os.name != "nt":
+            return
+
+        if not is_current_process_elevated():
+            self.logger.log(
+                "Run As Admin relaunch requested a Start With Windows task refresh, but the current session is not elevated."
+            )
+            return
+
+        if not bool(self.start_with_windows_var.get()):
+            self.logger.log(
+                "Run As Admin relaunch completed. No Start With Windows task refresh was needed because Start With Windows is disabled."
+            )
+            return
+
+        try:
+            self._sync_startup_registration(show_errors=False)
+        except Exception as exc:
+            self.logger.log(f"Failed to refresh the Start With Windows task after Run As Admin relaunch: {exc}")
+            return
+
+        self.logger.log(
+            "Run As Admin relaunch completed. Start With Windows task was refreshed with the current settings."
+        )
+
+    def _request_admin_relaunch(self, reason: str, extra_arguments: list[str] | None = None) -> None:
+        try:
+            relaunch_current_process_as_admin(extra_arguments)
+        except Exception as exc:
+            self.logger.log(f"Run As Admin elevation request was canceled or failed: {exc}")
+            raise
+
+        self.logger.log(
+            f"Run As Admin is enabled. Relaunching Backup Manager as administrator for this {reason.lower()} session."
+        )
+        self.closing = True
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        raise SystemExit(0)
+
+    def _startup_task_admin_refresh_arguments(self) -> list[str]:
+        if os.name != "nt":
+            return []
+
+        if not bool(self.start_with_windows_var.get()):
+            return []
+
+        return [STARTUP_ADMIN_APPLY_TASK_ARGUMENT]
+
+    def _can_relaunch_current_session_as_admin(self) -> bool:
+        if os.name != "nt":
+            return False
+        if self.startup_mode:
+            return False
+        if not self._startup_run_as_admin_enabled():
+            return False
+        if is_current_process_elevated():
+            return False
+        if STARTUP_ADMIN_RELAUNCH_ARGUMENT in sys.argv:
+            self.logger.log(
+                "Run As Admin relaunch was requested, but this session is still not elevated."
+            )
+            return False
+        return True
+
+    def _ensure_run_as_admin_session(self, reason: str) -> None:
+        if not self._can_relaunch_current_session_as_admin():
+            return
+
+        try:
+            self._request_admin_relaunch(
+                reason=reason,
+                extra_arguments=self._startup_task_admin_refresh_arguments(),
+            )
+        except Exception:
+            return
+
+    def _read_windows_startup_task_state(self) -> dict[str, object]:
+        if os.name != "nt":
+            return {
+                "folder_exists": False,
+                "task_exists": False,
+                "task_enabled": False,
+                "task_state": None,
+                "task_delay": None,
+                "task_run_level": 0,
+            }
+
+        script = r'''
+param(
+    [string]$TaskFolderPath,
+    [string]$TaskName
+)
+
+$service = New-Object -ComObject "Schedule.Service"
+$service.Connect()
+
+$folder = $null
+$task = $null
+$taskDelay = $null
+
+try {
+    $folder = $service.GetFolder($TaskFolderPath)
+} catch {
+    $folder = $null
+}
+
+if ($null -ne $folder) {
+    try {
+        $task = $folder.GetTask($TaskName)
+    } catch {
+        $task = $null
+    }
+}
+
+if ($null -ne $task) {
+    foreach ($trigger in $task.Definition.Triggers) {
+        if ([int]$trigger.Type -eq 9) {
+            $taskDelay = [string]$trigger.Delay
+            break
+        }
+    }
+}
+
+[pscustomobject]@{
+    folder_exists = [bool]($null -ne $folder)
+    task_exists = [bool]($null -ne $task)
+    task_enabled = if ($null -ne $task) { [bool]$task.Enabled } else { $false }
+    task_state = if ($null -ne $task) { [int]$task.State } else { $null }
+    task_delay = if (-not [string]::IsNullOrWhiteSpace($taskDelay)) { $taskDelay } else { $null }
+    task_run_level = if ($null -ne $task) { [int]$task.Definition.Principal.RunLevel } else { 0 }
+} | ConvertTo-Json -Compress
+'''
+        output = self._run_powershell(script, STARTUP_TASK_FOLDER_PATH, STARTUP_TASK_NAME)
+        if not output:
+            return {
+                "folder_exists": False,
+                "task_exists": False,
+                "task_enabled": False,
+                "task_state": None,
+                "task_delay": None,
+                "task_run_level": 0,
+            }
+        payload = json.loads(output)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Scheduled task state response was invalid.")
+        return payload
+
+    def _sync_startup_task_settings_from_task(self) -> None:
+        if os.name != "nt":
+            self.start_with_windows_var.set(False)
+            return
+
+        saved_start_with_windows = bool(self.start_with_windows_var.get())
+        saved_startup_delay_label = normalize_startup_delay_label(self.startup_delay_var.get())
+        saved_run_as_admin_label = normalize_enabled_disabled_label(self.startup_run_as_admin_var.get())
+
+        try:
+            state = self._read_windows_startup_task_state()
+        except Exception as exc:
+            self.logger.log(f"Could not read Start With Windows scheduled task state: {exc}")
+            return
+
+        task_exists = bool(state.get("task_exists", False))
+        task_enabled = bool(state.get("task_enabled", False))
+        self.start_with_windows_var.set(task_enabled)
+
+        # Preserve the GUI selections as the source of truth for the user's saved preference.
+        # The scheduled task can lag behind if elevation was canceled or if the task update failed,
+        # so do not overwrite the combobox values here with stale task state.
+        self.startup_delay_var.set(saved_startup_delay_label)
+        self.startup_run_as_admin_var.set(saved_run_as_admin_label)
+
+        should_compare_task_options = task_exists and (task_enabled or saved_start_with_windows)
+        if not should_compare_task_options:
+            return
+
+        task_delay_seconds = parse_task_scheduler_delay_to_seconds(state.get("task_delay"))
+        saved_startup_delay_seconds = STARTUP_DELAY_OPTIONS.get(saved_startup_delay_label, 0)
+
+        if task_delay_seconds != saved_startup_delay_seconds:
+            self.logger.log(
+                "Start With Windows task delay does not match the saved GUI setting. "
+                f"Saved={saved_startup_delay_label}, Task={normalize_startup_delay_label(task_delay_seconds)}."
+            )
 
     def _register_windows_startup(self) -> None:
         if os.name != "nt":
             raise RuntimeError("Start With Windows is only supported on Windows.")
 
-        import winreg
+        if not self._startup_run_as_admin_enabled():
+            raise RuntimeError(
+                'Start With Windows requires "Run As Admin" to be set to Enabled before the scheduled task can be created.'
+            )
 
-        command = self._build_startup_command()
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        ) as key:
-            winreg.SetValueEx(key, STARTUP_REGISTRY_VALUE_NAME, 0, winreg.REG_SZ, command)
+        executable_path, arguments, working_directory = self._build_startup_task_action_details()
+        startup_delay_seconds = self._startup_delay_seconds()
+        task_scheduler_delay = startup_delay_seconds_to_task_scheduler_delay(startup_delay_seconds)
 
-        self.logger.log(f"Start With Windows enabled. Registry command: {command}")
+        script = r'''
+param(
+    [string]$TaskFolderPath,
+    [string]$TaskName,
+    [string]$ExecutablePath,
+    [string]$Arguments,
+    [string]$WorkingDirectory,
+    [string]$TriggerDelay
+)
+
+function Get-OrCreateTaskFolder {
+    param(
+        [object]$Service,
+        [string]$FolderPath
+    )
+
+    $normalizedPath = '\' + $FolderPath.Trim('\')
+
+    if ($normalizedPath -eq '\') {
+        return $Service.GetFolder('\')
+    }
+
+    $currentFolder = $Service.GetFolder('\')
+
+    foreach ($segment in $normalizedPath.Trim('\').Split('\')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+
+        try {
+            $currentFolder = $currentFolder.GetFolder($segment)
+        } catch {
+            $currentFolder = $currentFolder.CreateFolder($segment, $null)
+        }
+    }
+
+    return $currentFolder
+}
+
+$service = New-Object -ComObject "Schedule.Service"
+$service.Connect()
+
+$taskFolder = Get-OrCreateTaskFolder -Service $service -FolderPath $TaskFolderPath
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$taskDefinition = $service.NewTask(0)
+
+$taskDefinition.RegistrationInfo.Description = "Automatically starts JBH Services Backup Manager when the current user signs in to Windows."
+$taskDefinition.Principal.UserId = $currentUser
+$taskDefinition.Principal.LogonType = 3
+$taskDefinition.Principal.RunLevel = 1
+$taskDefinition.Settings.Enabled = $true
+$taskDefinition.Settings.StartWhenAvailable = $true
+$taskDefinition.Settings.AllowDemandStart = $true
+$taskDefinition.Settings.DisallowStartIfOnBatteries = $false
+$taskDefinition.Settings.StopIfGoingOnBatteries = $false
+$taskDefinition.Settings.Hidden = $false
+$taskDefinition.Settings.ExecutionTimeLimit = "PT0S"
+
+$logonTrigger = $taskDefinition.Triggers.Create(9)
+$logonTrigger.Enabled = $true
+$logonTrigger.UserId = $currentUser
+$logonTrigger.Delay = if ([string]::IsNullOrWhiteSpace($TriggerDelay)) { "PT0S" } else { $TriggerDelay }
+
+$execAction = $taskDefinition.Actions.Create(0)
+$execAction.Path = $ExecutablePath
+
+if (-not [string]::IsNullOrWhiteSpace($Arguments)) {
+    $execAction.Arguments = $Arguments
+}
+
+if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {
+    $execAction.WorkingDirectory = $WorkingDirectory
+}
+
+$null = $taskFolder.RegisterTaskDefinition($TaskName, $taskDefinition, 6, $currentUser, $null, 3, $null)
+$task = $taskFolder.GetTask($TaskName)
+$task.Enabled = $true
+
+$taskDelay = $null
+foreach ($trigger in $task.Definition.Triggers) {
+    if ([int]$trigger.Type -eq 9) {
+        $taskDelay = [string]$trigger.Delay
+        break
+    }
+}
+
+[pscustomobject]@{
+    task_path = $TaskFolderPath.TrimEnd('\') + '\' + $TaskName
+    enabled = [bool]$task.Enabled
+    trigger_delay = if (-not [string]::IsNullOrWhiteSpace($taskDelay)) { $taskDelay } else { $null }
+    run_level = [int]$task.Definition.Principal.RunLevel
+} | ConvertTo-Json -Compress
+'''
+        output = self._run_powershell(
+            script,
+            STARTUP_TASK_FOLDER_PATH,
+            STARTUP_TASK_NAME,
+            executable_path,
+            arguments,
+            working_directory,
+            task_scheduler_delay,
+        )
+
+        task_state = {}
+        if output:
+            try:
+                parsed = json.loads(output)
+                if isinstance(parsed, dict):
+                    task_state = parsed
+            except Exception as exc:
+                raise RuntimeError(f"Scheduled task registration returned invalid data: {exc}") from exc
+
+        registered_delay_seconds = parse_task_scheduler_delay_to_seconds(task_state.get("trigger_delay"))
+        task_enabled = bool(task_state.get("enabled", False))
+        task_run_level = task_state.get("run_level", 0)
+
+        if not task_enabled:
+            raise RuntimeError("Task Scheduler reported that the startup task was created but not enabled.")
+
+        if registered_delay_seconds != startup_delay_seconds:
+            raise RuntimeError(
+                "Task Scheduler did not apply the requested startup delay. "
+                f"Expected {startup_delay_seconds} seconds, but the task reports {registered_delay_seconds} seconds."
+            )
+
+        if not is_task_run_level_highest(task_run_level):
+            raise RuntimeError(
+                'Task Scheduler did not enable "Run with highest privileges" for the startup task.'
+            )
+
+        self.logger.log(
+            f"Start With Windows enabled. Scheduled task enabled: {self._get_windows_startup_task_path()}"
+        )
+        self.logger.log(f"Startup command: {self._build_startup_command()}")
+        self.logger.log("Task Scheduler option 'Run with highest privileges' is enabled.")
+        self.logger.log(f"Task Scheduler startup delay set to {normalize_startup_delay_label(startup_delay_seconds)}.")
 
     def _remove_windows_startup(self) -> None:
         if os.name != "nt":
             return
 
-        try:
-            import winreg
+        script = r'''
+param(
+    [string]$TaskFolderPath,
+    [string]$TaskName
+)
 
-            with winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0,
-                winreg.KEY_SET_VALUE,
-            ) as key:
-                winreg.DeleteValue(key, STARTUP_REGISTRY_VALUE_NAME)
-            self.logger.log("Start With Windows disabled. Startup registry entry removed.")
-        except FileNotFoundError:
-            pass
-        except Exception as exc:
-            self.logger.log(f"Could not remove startup registry entry: {exc}")
+$service = New-Object -ComObject "Schedule.Service"
+$service.Connect()
+
+$folder = $null
+$task = $null
+
+try {
+    $folder = $service.GetFolder($TaskFolderPath)
+} catch {
+    $folder = $null
+}
+
+if ($null -ne $folder) {
+    try {
+        $task = $folder.GetTask($TaskName)
+    } catch {
+        $task = $null
+    }
+}
+
+if ($null -ne $task) {
+    $task.Enabled = $false
+}
+
+[pscustomobject]@{
+    task_exists = [bool]($null -ne $task)
+    enabled = if ($null -ne $task) { [bool]$task.Enabled } else { $false }
+} | ConvertTo-Json -Compress
+'''
+        output = self._run_powershell(script, STARTUP_TASK_FOLDER_PATH, STARTUP_TASK_NAME)
+
+        task_exists = False
+        if output:
+            try:
+                payload = json.loads(output)
+                if isinstance(payload, dict):
+                    task_exists = bool(payload.get("task_exists", False))
+            except Exception:
+                task_exists = False
+
+        if task_exists:
+            self.logger.log(
+                f"Start With Windows disabled. Scheduled task disabled: {self._get_windows_startup_task_path()}"
+            )
 
     def _load_app_settings(self) -> None:
         if not APP_SETTINGS_PATH.exists():
@@ -3153,9 +3151,18 @@ class BackupManagerApp:
         self.close_to_tray_var.set(bool(payload.get("close_to_tray", False)))
         self.run_missed_schedule_at_startup_var.set(bool(payload.get("run_missed_schedule_at_startup", False)))
         self.startup_delay_var.set(normalize_startup_delay_label(payload.get("startup_delay", payload.get("startup_delay_seconds", "Off"))))
+        self.startup_run_as_admin_var.set(
+            normalize_enabled_disabled_label(
+                payload.get(
+                    "startup_run_as_admin",
+                    payload.get("startup_run_as_admin_enabled", "Disabled"),
+                )
+            )
+        )
 
     def _write_app_settings(self) -> None:
         startup_delay_label = normalize_startup_delay_label(self.startup_delay_var.get())
+        startup_run_as_admin_label = normalize_enabled_disabled_label(self.startup_run_as_admin_var.get())
         payload = {
             "start_with_windows": bool(self.start_with_windows_var.get()),
             "start_minimized_to_tray": bool(self.start_minimized_to_tray_var.get()),
@@ -3163,20 +3170,45 @@ class BackupManagerApp:
             "run_missed_schedule_at_startup": bool(self.run_missed_schedule_at_startup_var.get()),
             "startup_delay": startup_delay_label,
             "startup_delay_seconds": STARTUP_DELAY_OPTIONS.get(startup_delay_label, 0),
+            "startup_run_as_admin": startup_run_as_admin_label,
+            "startup_run_as_admin_enabled": STARTUP_ADMIN_OPTIONS.get(startup_run_as_admin_label, False),
         }
         APP_SETTINGS_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _sync_startup_registration(self, show_errors: bool = False) -> None:
         requested = bool(self.start_with_windows_var.get())
-        allowed = self._can_enable_start_with_windows()
+        unavailable_message = self._get_start_with_windows_unavailable_message()
+        allowed = unavailable_message == ""
 
         if not allowed:
             if requested:
                 self.start_with_windows_var.set(False)
-                self.logger.log("Start With Windows was turned off because Schedule is disabled and Instant Sync is not active.")
+                self.logger.log(f"Start With Windows was turned off because {unavailable_message}")
             self._remove_windows_startup()
             self._write_app_settings()
             return
+
+        if requested and self._startup_run_as_admin_enabled() and os.name == "nt" and not is_current_process_elevated():
+            self._write_app_settings()
+            try:
+                self._request_admin_relaunch(
+                    reason="Start With Windows",
+                    extra_arguments=[STARTUP_ADMIN_APPLY_TASK_ARGUMENT],
+                )
+            except SystemExit:
+                raise
+            except Exception as exc:
+                self.start_with_windows_var.set(False)
+                self._write_app_settings()
+                self.logger.log(f"Start With Windows requires an elevated session before the scheduled task can be created: {exc}")
+                if show_errors:
+                    messagebox.showerror(
+                        self.metadata.app_title,
+                        "Start With Windows needs administrator approval before the scheduled task can be created.\n\n"
+                        f"{exc}",
+                        parent=self.root,
+                    )
+                return
 
         if requested:
             try:
@@ -3199,14 +3231,24 @@ class BackupManagerApp:
         self._write_app_settings()
 
     def refresh_settings_controls(self) -> None:
-        can_enable_start_with_windows = self._can_enable_start_with_windows()
+        unavailable_message = self._get_start_with_windows_unavailable_message()
+        can_enable_start_with_windows = unavailable_message == ""
+
         if can_enable_start_with_windows:
             self.start_with_windows_check.configure(state="normal")
             self.start_with_windows_label.configure(fg=TEXT)
-        else:
-            self.start_with_windows_check.configure(state="disabled")
-            self.start_with_windows_label.configure(fg=MUTED)
-        self._sync_startup_registration(show_errors=False)
+            return
+
+        self.start_with_windows_check.configure(state="disabled")
+        self.start_with_windows_label.configure(fg=MUTED)
+
+        if self.start_with_windows_var.get():
+            self.start_with_windows_var.set(False)
+            self._remove_windows_startup()
+            self._write_app_settings()
+            self.logger.log(
+                f"Start With Windows was turned off because {unavailable_message}"
+            )
 
     def on_start_with_windows_toggle(self) -> None:
         self._sync_startup_registration(show_errors=True)
@@ -3237,15 +3279,57 @@ class BackupManagerApp:
         startup_delay_label = normalize_startup_delay_label(self.startup_delay_var.get())
         self.startup_delay_var.set(startup_delay_label)
         self._write_app_settings()
+
+        if self.start_with_windows_var.get():
+            self._sync_startup_registration(show_errors=True)
+            self.logger.log(
+                f"Task Scheduler startup delay updated to {startup_delay_label}."
+            )
+            return
+
         self.logger.log(
-            f"Delay Startup set to {startup_delay_label} for startup launches."
+            f"Delay Startup saved as {startup_delay_label}. It will be applied the next time Start With Windows is enabled."
+        )
+
+    def on_startup_run_as_admin_changed(self) -> None:
+        startup_run_as_admin_label = normalize_enabled_disabled_label(self.startup_run_as_admin_var.get())
+        self.startup_run_as_admin_var.set(startup_run_as_admin_label)
+        self._write_app_settings()
+
+        if startup_run_as_admin_label == "Enabled" and self._can_relaunch_current_session_as_admin():
+            try:
+                self._request_admin_relaunch(
+                    reason="Current",
+                    extra_arguments=self._startup_task_admin_refresh_arguments(),
+                )
+            except Exception as exc:
+                self.startup_run_as_admin_var.set("Disabled")
+                self._write_app_settings()
+                self.refresh_settings_controls()
+                self.logger.log(
+                    f"Run As Admin was turned back to Disabled because administrator approval was canceled or failed: {exc}"
+                )
+                return
+
+        self._sync_startup_registration(show_errors=False)
+        self.refresh_settings_controls()
+
+        self.logger.log(
+            f"Run As Admin saved as {normalize_enabled_disabled_label(self.startup_run_as_admin_var.get())}. "
+            "It applies to the current manual session when elevated and to future manual launches."
         )
 
     def _startup_delay_seconds(self) -> int:
         return STARTUP_DELAY_OPTIONS.get(normalize_startup_delay_label(self.startup_delay_var.get()), 0)
 
+    def _startup_run_as_admin_enabled(self) -> bool:
+        return STARTUP_ADMIN_OPTIONS.get(
+            normalize_enabled_disabled_label(self.startup_run_as_admin_var.get()),
+            False,
+        )
+
     def _should_delay_startup_processing(self) -> bool:
-        return self.startup_mode and self._startup_delay_seconds() > 0
+        return False
 
     def initialize_startup_processing(self) -> None:
         if self.startup_processing_initialized:
@@ -3254,18 +3338,14 @@ class BackupManagerApp:
         startup_delay_seconds = self._startup_delay_seconds()
         if self.startup_mode:
             self.logger.log("Startup launch detected.")
-
-        if self._should_delay_startup_processing():
-            self.startup_processing_ready = False
-            self.logger.log(
-                f"Startup processing delayed for {startup_delay_seconds} seconds to allow Windows, network paths, and mapped drives to finish loading."
-            )
-            self.root.after(startup_delay_seconds * 1000, self.begin_startup_processing)
-            return
+            if startup_delay_seconds > 0:
+                self.logger.log(
+                    f"Task Scheduler logon delay was configured for {startup_delay_seconds} seconds before Backup Manager launched."
+                )
+            else:
+                self.logger.log("Task Scheduler launched Backup Manager without a startup delay.")
 
         self.startup_processing_ready = True
-        if self.startup_mode:
-            self.logger.log("Startup delay is Off. Startup processing will begin immediately.")
         self.begin_startup_processing()
 
     def begin_startup_processing(self) -> None:
@@ -3274,9 +3354,6 @@ class BackupManagerApp:
 
         self.startup_processing_initialized = True
         self.startup_processing_ready = True
-
-        if self.startup_mode and self._startup_delay_seconds() > 0:
-            self.logger.log("Startup delay complete. Beginning startup schedule checks and automation.")
 
         self.configure_insta_sync_watcher()
         self.root.after(1000, self.schedule_tick)
@@ -3367,6 +3444,7 @@ class BackupManagerApp:
         self.active_job_reason = reason
         self.active_scheduled_occurrence_iso = scheduled_occurrence_iso
         self.set_controls_for_active_run()
+        self._cancel_progress_reset()
         self.latest_progress_bytes = 0
         self.pause_btn.configure(text="Pause")
         self.progress_var.set(0)
@@ -3380,6 +3458,34 @@ class BackupManagerApp:
         self.redraw_progress_bar()
         self.worker.start()
         self.update_tray_icon_state("running")
+
+    def _cancel_progress_reset(self) -> None:
+        if self.progress_reset_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self.progress_reset_after_id)
+        except Exception:
+            pass
+        self.progress_reset_after_id = None
+
+    def _reset_progress_to_ready(self) -> None:
+        self.progress_reset_after_id = None
+        if self.worker is not None or self.pending_jobs:
+            return
+        self.latest_progress_bytes = 0
+        self.progress_var.set(0)
+        self.progress_label_var.set("0 %")
+        self.current_file_var.set("Ready")
+        self.transfer_current_var.set("Currently: 0 Kbps")
+        self.transfer_min_var.set("Min: 0 Kbps")
+        self.transfer_max_var.set("Max: 0 Kbps")
+        self.elapsed_var.set("Elapsed Time\n--")
+        self.estimated_var.set("Estimated Time\n--")
+        self.redraw_progress_bar()
+
+    def _schedule_progress_ready_reset(self, delay_ms: int = 3000) -> None:
+        self._cancel_progress_reset()
+        self.progress_reset_after_id = self.root.after(delay_ms, self._reset_progress_to_ready)
 
     def finish_active_run(self, success: bool, stopped: bool) -> None:
         if self.worker is None:
@@ -3419,6 +3525,9 @@ class BackupManagerApp:
             return
 
         self.set_controls_for_idle_state()
+
+        if success or stopped:
+            self._schedule_progress_ready_reset(3000)
 
         if self.mode_var.get() == MODE_INSTANT_SYNC:
             self.logger.log("Sync idle. Waiting for next file change.")

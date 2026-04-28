@@ -1,341 +1,354 @@
 # JBH Services Backup Manager
 
-**Version:** 1.0.0  
-**Build:** 0421.26  
-**Release:** Initial Release
+A lightweight Windows backup utility by **Butterz51 / JBH Services** for configuring and running local or network backups through a simple desktop interface.
 
-JBH Services Backup Manager is a lightweight Windows backup utility built by **Butterz51 / JBH Services**. It provides a clean desktop interface for running and managing file backups with support for **Copy**, **Mirror**, and **Instant Sync** workflows.
+The application is built around Robocopy-backed backup jobs, saved JSON configurations, schedule automation, network destination checks, tray behavior, and Windows Task Scheduler startup integration.
 
-The manager is designed for practical day-to-day use: select one or more source paths, choose a destination, save the job as a JSON configuration, and run it manually, on a schedule, or automatically when file changes are detected.
 
 ---
 
-## Purpose
-
-This project exists to provide a straightforward backup manager that is easy to use, easy to review, and practical for Windows systems that rely on local paths, mapped drives, or UNC network paths.
-
-The application focuses on:
-
-- Clear backup job setup
-- Reliable Robocopy-based file transfer
-- Scheduled automation
-- Live progress and transfer monitoring
-- Simple startup and tray behavior for always-on use
-
----
-
-## Core Features
+## Features
 
 ### Backup modes
 
-- **Copy**
-  - Copies source files and folders to the destination
-  - Preserves existing destination content that is not part of the current source set
-
-- **Mirror**
-  - Mirrors source folders to the destination using Robocopy `/MIR`
-  - Detects extra destination files as mirror cleanup candidates
-  - **Important:** Mirror mode is folder-only in the current release
-
-- **Instant Sync**
-  - Watches source locations for file changes
-  - Debounces activity before starting a sync run
-  - Intended for near-real-time backup behavior after source changes are detected
+| Mode | Purpose | Behavior |
+| --- | --- | --- |
+| **Copy** | Standard non-destructive backup mode | Copies selected files and folders to the destination without purging extra destination files. |
+| **Mirror** | Exact folder mirror mode | Uses Robocopy mirror behavior. Destination files that no longer exist in the source may be deleted. |
+| **Instant Sync** | Watch source paths and run after changes | Uses a file watcher with a quiet/debounce period before running a backup job. |
 
 ### Scheduling
 
-- Daily scheduling
-- Weekly scheduling
-- Bi-weekly scheduling
-- Monthly scheduling
-- Run missed schedule at startup
-- Optional startup delay for scheduled or automatic launches
+Backup Manager supports scheduled jobs from the built-in schedule dialog.
 
-### Runtime controls
+Supported schedule types:
 
-- Manual run
-- Pause and resume support
-- Stop active jobs
-- Kill active Robocopy task if the app is closed while paused or running
-- Live transfer-rate monitoring for network sends
-- Progress tracking with current file display and estimated remaining time
+- Daily
+- Weekly
+- Bi-weekly
+- Monthly pattern schedules, such as first Monday or last Friday
 
-### Windows integration
+The app can also check for a missed scheduled run at startup when **Run Missed Schedule At Startup** is enabled.
 
-- Start With Windows
-- Start Minimized To Tray
-- Close To Tray
-- System tray icon with idle, running, paused, and stopped states
+### Windows startup integration
 
-### Path handling
+Backup Manager uses **Windows Task Scheduler** for startup behavior instead of writing directly to the registry.
 
-- Supports local destination paths
-- Supports UNC network destination paths
-- Includes **Test Network Path** validation before running
-- Checks reachability, share access, and parent-path availability when the exact folder does not yet exist
+Startup task details:
 
-### Configuration and persistence
+- Task Scheduler folder: `\My Tasks\Windows`
+- Task name: `Backup Manager Startup`
+- Trigger: user logon
+- Optional startup delay: `Off`, `15s`, `30s`, or `60s`
+- Supports **Run with highest privileges** when Run As Admin is enabled
 
-- Save job configurations as JSON files
-- Restore previous runtime settings
-- Persist app state and schedule-related runtime data between launches
+### Network and mapped drive support
 
----
+The app includes destination path testing for local paths, UNC paths, and Windows mapped drives.
 
-## Platform Requirements
+Network handling includes:
 
-This release is intended for **Windows**.
+- UNC path validation
+- mapped drive resolution
+- persistent mapped drive detection
+- admin-session mapped drive reconnect support
+- ping and path access checks
+- clearer test result messages for reachable and unreachable destinations
 
-### Required
+### Runtime interface
 
-- Windows system with **Robocopy** available
-- Access to source and destination paths
+The GUI includes:
 
-### Optional Python packages used by the source build
-
-- `psutil` — pause/resume support and network transfer monitoring
-- `watchdog` — Instant Sync file system watching
-- `pystray` — system tray behavior
-- `Pillow` — tray icon image loading
-
-If optional dependencies are missing, related features may be unavailable.
+- source file/folder selection
+- destination selection
+- config save/load
+- schedule setup
+- Run Now, Pause, Resume, and Stop controls
+- live current file/status display
+- progress bar
+- elapsed and estimated time display
+- current, minimum, and maximum transfer rate display
+- in-memory log viewer
+- About dialog with project links
+- system tray support when available
 
 ---
 
-## Folder Layout
+## Backup safety notes
 
-Typical packaged layout:
+Mirror mode is destructive by design.
 
-```
-JBH Services Backup Manager.exe
-Data/
-  Assets/
-    AppCore.dll
-    jbh_backup_manager.ico
-    jbh_backup_manager.png
-    jbh_tray_idle.png
-    jbh_tray_running.png
-    jbh_tray_paused.png
-    jbh_tray_stopped.png
-configs/
-runtime/
-_internal/
-main.py
-build_app_product_dll.py
-```
+When Mirror mode is selected, Robocopy uses mirror behavior to make the destination match the source. Any files or folders in the destination that are not present in the source may be removed.
 
-### Important folders
+Recommended safety checks before using Mirror mode:
 
-- `Data/Assets/`
-  - Stores icons and protected app metadata payload (`AppCore.dll`)
-- `configs/`
-  - Saved backup job configurations
-- `runtime/`
-  - App settings, last session data, and runtime state files
+1. Use a dedicated destination folder.
+2. Do not select a broad drive root as the destination unless that is intentional.
+3. Test with a small folder first.
+4. Review the selected source and destination carefully before running the job.
+
+Copy mode is the safer default because it does not purge extra destination files.
 
 ---
 
-## How It Works
-
-The manager builds a backup plan from the selected sources, destination, and mode, then executes the job through **Robocopy**.
-
-### Robocopy behavior in this release
-
-The app uses Robocopy with practical defaults such as retry handling, FAT file-time tolerance, junction avoidance, and data/attribute/time copy behavior.
-
-Examples of behaviors implemented by the manager include:
-
-- Copying full folders with recursive traversal
-- Copying individual files into the destination root
-- Mirror cleanup reporting in Mirror mode
-- File comparison using size and modified time tolerance before counting work
-
----
-
-## Using the Manager
-
-### 1. Create a job
-
-- Enter a **Config Name**
-- Add one or more source files or folders
-- Select a destination path
-- Choose **Copy**, **Mirror**, or **Instant Sync**
-
-### 2. Validate the destination
-
-- Use **Test Network Path** to confirm the destination is reachable
-- This is especially useful for mapped drives, NAS targets, and UNC paths
-
-### 3. Configure schedule and startup behavior
-
-Optional settings include:
-
-- Enable Schedule
-- Start With Windows
-- Start Minimized To Tray
-- Close To Tray
-- Run Missed Schedule At Startup
-- Delay Startup: `Off`, `15s`, `30s`, `60s`
-
-### 4. Save the configuration
-
-Configurations are stored as JSON files under `configs/`.
-
-### 5. Run the job
-
-- Click **Run** for a manual backup
-- Watch progress, current file activity, transfer speed, and estimated time
-- Use **Pause**, **Resume**, or **Stop** as needed
-
----
-
-## Schedule Types
-
-The manager supports the following schedule patterns:
-
-- **Daily**
-- **Weekly**
-- **Bi-Weekly**
-- **Monthly**
-
-The schedule setup UI allows you to store weekday-based patterns for monthly scheduling and anchor-based behavior for bi-weekly and weekly patterns.
-
----
-
-## Instant Sync Notes
-
-Instant Sync watches the configured source locations and triggers a backup after file activity settles for a short quiet period.
-
-Use Instant Sync when you want the manager to behave more like an automatic file-change watcher than a traditional scheduled backup job.
-
----
-
-## Network Path Validation
-
-The **Test Network Path** feature checks whether the destination is usable before a run starts.
-
-Depending on the destination type, the manager can:
-
-- Validate local paths
-- Validate UNC paths such as `\\Server\Share\Backups`
-- Ping the remote server
-- Confirm whether the target path exists
-- Confirm whether the parent/share path is reachable even if the final folder does not yet exist
-
-This helps catch common problems early, such as:
-
-- Wrong server/share names
-- Unavailable mapped or local drives
-- Missing folders
-- Permission or access issues
-
----
-
-## Running From Source
-
-A basic source workflow on Windows is:
-
-```bash
-pip install psutil watchdog pystray pillow
-python build_app_product_dll.py
-python main.py
-```
-
-### Notes
-
-- `build_app_product_dll.py` writes the protected metadata payload used by the application.
-- The app expects assets in one of these locations:
-  - `Data/Assets`
-  - `Assets`
-  - application root
-
----
-
-## Build Notes
-
-The packaged release includes:
-
-- the main executable
-- bundled Python runtime files under `_internal/`
-- required asset files under `Data/Assets/`
-
-If you package the app yourself, make sure the asset folder is included alongside the executable and that `AppCore.dll` is generated before packaging.
-
----
-
-## Known Release Notes for v1.0.0
-
-### Current strengths
-
-- Clean desktop workflow for backup job creation
-- Multiple backup modes
-- Basic scheduling support
-- Startup and tray integration
-- Network path validation
-- Live network send-rate reporting during remote copy jobs
-
-### Current limitations
-
-- Mirror mode does not support file-only source entries in this release
-- Windows-only behavior is expected for Robocopy and startup integration
-- Some advanced features depend on optional Python packages when running from source
-
----
-
-## Recommended GitHub Repository Structure
-
-Suggested repository layout:
+## Project structure
 
 ```text
-README.md
-main.py
-build_app_product_dll.py
-Data/
-  Assets/
-configs/
-runtime/
+JBH Backup Manager/
+├─ Configs/
+│  └─ *.json
+├─ Data/
+│  ├─ Assets/
+│  │  ├─ AppCore.dll
+│  │  ├─ jbh_backup_manager.ico
+│  │  └─ tray/icon assets
+│  ├─ Scripts/
+│  │  ├─ Build Files/
+│  │  │  ├─ build.ps1
+│  │  │  ├─ build_exe.bat
+│  │  │  └─ build_jbh_backup_manager.spec
+│  │  └─ Python/
+│  │     ├─ main.py
+│  │     ├─ main_window.py
+│  │     ├─ app_core.py
+│  │     ├─ config_models.py
+│  │     ├─ copy_mode.py
+│  │     ├─ mirror_mode.py
+│  │     ├─ sync_mode.py
+│  │     ├─ schedule.py
+│  │     ├─ uac_admin.py
+│  │     └─ supporting modules
+│  ├─ app_settings.json
+│  ├─ app_state.json
+│  └─ last_session.json
+├─ LICENSE
+└─ JBH Services Backup Manager.exe
 ```
 
-You may also want to add later:
+### Important runtime files
 
-- `.gitignore`
-- `CHANGELOG.md`
-- `LICENSE`
-- `docs/`
-- packaging/build notes
-
----
-
-## Suggested Project Naming
-
-### Current product title
-
-**JBH Services Backup Manager**
-
-This title is valid and fits the application well.
-
-### Recommended public-facing shorthand
-
-**JBH Backup Manager**
-
-This shorter form reads more cleanly for:
-
-- GitHub repository naming
-- release titles
-- screenshots
-- public posts
-
-### Recommended usage split
-
-- **App title:** `JBH Services Backup Manager`
-- **Repository name:** `JBH-Backup-Manager`
-- **Short public name:** `JBH Backup Manager`
+| File | Purpose |
+| --- | --- |
+| `Data/Assets/AppCore.dll` | Required application metadata and runtime settings package. |
+| `Data/app_settings.json` | Stores user-facing app settings such as tray behavior, startup options, and admin startup preference. |
+| `Data/app_state.json` | Stores runtime state. |
+| `Data/last_session.json` | Stores last loaded config/session recovery data. |
+| `Configs/*.json` | Saved backup job configurations. |
 
 ---
 
-## Support and Project Links
+## Requirements
 
-- **Author:** Butterz51 / JBH Services
-- **Repository:** `https://github.com/Butterz51/JBH-Backup-Manager`
-- **Discord:** `https://discord.gg/ZJpBrkgwA7`
-- **Donation:** `https://paypal.me/D2ServicesByJBH?country.x=CA&locale.x=en_US`
+### End-user requirements
+
+- Windows 10 or Windows 11
+- Robocopy available through Windows
+- PowerShell available for Task Scheduler integration
+- Network permissions for any selected network destination
+- Administrator approval when enabling Run As Admin or startup tasks that require highest privileges
+
+### Source/development requirements
+
+The codebase is Python-based and uses Tkinter for the GUI.
+
+Recommended development dependencies:
+
+```powershell
+pip install pyinstaller pillow pystray psutil watchdog
+```
+
+Dependency notes:
+
+- `watchdog` is required for Instant Sync file watching.
+- `psutil` is used for process pause/resume support.
+- `pystray` and `Pillow` are used for tray icon support.
+- `pyinstaller` is used for building the packaged executable.
+
+---
+
+## Running from source
+
+From the project root:
+
+```powershell
+python Data\Scripts\Python\main.py
+```
+
+The application expects the following required asset to exist:
+
+```text
+Data\Assets\AppCore.dll
+```
+
+If `AppCore.dll` is missing, invalid, or corrupted, the app will show a controlled startup error instead of a raw Python or PyInstaller traceback.
+
+---
+
+## Building the executable
+
+The project includes both PowerShell and batch build helpers.
+
+### PowerShell build
+
+```powershell
+Set-Location "E:\GitHub\JBH Services\JBH Backup Manager"
+.\Data\Scripts\Build Files\build.ps1
+```
+
+### Batch build
+
+```cmd
+cd /d "E:\GitHub\JBH Services\JBH Backup Manager"
+"Data\Scripts\Build Files\build_exe.bat"
+```
+
+The PyInstaller spec file includes the `Data\Assets` folder so the executable can locate required icons and `AppCore.dll` at runtime.
+
+---
+
+## Basic usage
+
+1. Open **JBH Services Backup Manager**.
+2. Enter a **Config Name**.
+3. Select a **Destination**.
+4. Choose a backup mode:
+   - `Copy`
+   - `Mirror`
+   - `Instant Sync`
+5. Click **Source** and add one or more files or folders.
+6. Optional: click **Test Network Path** to verify the destination.
+7. Optional: enable and configure **Schedule**.
+8. Click **Save Config**.
+9. Click **Run Now** to start a manual backup.
+
+---
+
+## Scheduling workflow
+
+1. Enable **Schedule**.
+2. Click **Set Schedule**.
+3. Select a schedule type.
+4. Select the required date pattern or anchor date.
+5. Set the run time.
+6. Save the schedule.
+7. Save the config.
+
+Expected result:
+
+- The schedule summary updates in the main window.
+- The app checks for due scheduled runs while it is open.
+- If startup options are configured, the app can launch at logon and optionally check missed schedules.
+
+---
+
+## Start With Windows workflow
+
+Start With Windows is managed through Windows Task Scheduler.
+
+To enable it:
+
+1. Use the compiled `.exe` build.
+2. Set **Run As Admin** to `Enabled`.
+3. Enable **Schedule** or use **Instant Sync** mode.
+4. Check **Start With Windows**.
+5. Approve the UAC prompt if requested.
+
+Expected result:
+
+- The startup task is created or updated under `\My Tasks\Windows`.
+- The task is configured to launch Backup Manager at user logon.
+- The task uses highest privileges when Run As Admin is enabled.
+- The configured startup delay is applied.
+
+To disable it:
+
+1. Uncheck **Start With Windows**.
+2. The scheduled task is disabled.
+
+---
+
+## Troubleshooting
+
+### AppCore.DLL file not found
+
+Expected location:
+
+```text
+Data\Assets\AppCore.dll
+```
+
+Fix:
+
+1. Confirm the file exists.
+2. If the file exists but the error still appears, replace it with a fresh copy from the project source.
+3. Rebuild the executable if the packaged app is missing the asset.
+
+### Start With Windows is unavailable
+
+Start With Windows requires a compiled `.exe` build and compatible startup settings.
+
+Check that:
+
+- the app is running from the compiled executable
+- Run As Admin is set to `Enabled`
+- Schedule is enabled or Instant Sync mode is selected
+- administrator approval was accepted when prompted
+
+### Network path test fails
+
+Check that:
+
+- the server is online
+- the share exists
+- the account running Backup Manager has access
+- the destination path is a full local path, UNC path, or valid mapped drive path
+- mapped drives are available in the current user/admin session
+
+### Mirror mode refuses a file source
+
+Mirror mode currently supports folder sources only. Remove file sources or switch to Copy or Instant Sync mode.
+
+### Tray features do not work when running from source
+
+Install the tray dependencies:
+
+```powershell
+pip install pillow pystray
+```
+
+### Instant Sync does not watch for changes
+
+Install the file watcher dependency:
+
+```powershell
+pip install watchdog
+```
+
+---
+
+## Release checklist
+
+Before publishing a release build:
+
+1. Update AppCore metadata version and build label.
+2. Build from a clean project folder.
+3. Confirm `Data\Assets\AppCore.dll` is included in the packaged build.
+4. Confirm the main window icon and taskbar icon display correctly.
+5. Test Copy mode with files and folders.
+6. Test Mirror mode with a disposable destination folder.
+7. Test Instant Sync with a small watched folder.
+8. Test schedule creation and scheduled execution.
+9. Test Start With Windows task creation, disabling, and startup delay.
+10. Test Run As Admin persistence after UAC relaunch.
+11. Test admin and non-admin network path validation.
+12. Test mapped drive browsing in admin mode.
+13. Verify antivirus behavior on a clean signed or unsigned build.
+14. Tag the release in GitHub.
+
+---
+
+## License
+
+This project is licensed under the MIT License.
+
+Copyright © 2026 Butterz51.
